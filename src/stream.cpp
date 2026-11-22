@@ -8,6 +8,7 @@
 #include <cstring>
 #include <fstream>
 #include <future>
+#include <mutex>
 #include <optional>
 #include <queue>
 #include <utility>
@@ -28,6 +29,9 @@
 #include "logging.h"
 #include "network.h"
 #include "platform/common.h"
+#ifdef _WIN32
+  #include "platform/windows/clipboard.h"
+#endif
 #include "process.h"
 #include "stream.h"
 #include "sync.h"
@@ -498,6 +502,7 @@ namespace stream {
    * @brief Runtime state for one audio/video streaming session.
    */
   struct session_t {
+    bool lock_on_disconnect {};  ///< Lock requested by this session or by the host.
     config_t config;  ///< Stream or encoder configuration captured for the worker.
 
     safe::mail_t mail;  ///< Mailbox used to distribute packets and lifecycle events.
@@ -561,6 +566,7 @@ namespace stream {
     } control;  ///< Runtime state for the encrypted GameStream control channel.
 
     std::uint32_t launch_session_id;  ///< RTSP launch-session ID associated with this stream.
+    clipboard::grant_t clipboard_grant;  ///< Session-scoped clipboard capability.
     std::string client_cert;  ///< PEM certificate for the paired client owning the stream.
     std::string input_session_id;  ///< Stable client identity used to retain input devices across resume.
 
@@ -2258,13 +2264,14 @@ namespace stream {
   }
 
   namespace session {
-    std::atomic_uint running_sessions;  ///< Running sessions.
+    std::mutex lifecycle_mutex;  ///< Serializes the first-session and last-session callbacks.
+    activity_t activity;  ///< First and last stream transitions protected by lifecycle_mutex.
 
     /**
      * @brief Platform handle returned from stream setup.
      */
     state_e state(session_t &session) {
-      return session.state.load(std::memory_order_relaxed);
+      return session.state.load(std::memory_order_acquire);
     }
 
     /**
@@ -2272,6 +2279,10 @@ namespace stream {
      */
     const std::string &client_cert(session_t &session) {
       return session.client_cert;
+    }
+
+    const clipboard::grant_t &clipboard_grant(const session_t &session) {
+      return session.clipboard_grant;
     }
 
     /**
@@ -2317,8 +2328,14 @@ namespace stream {
       input::reset(session.input);
 
       // If this is the last session, invoke the platform callbacks
-      if (--running_sessions == 0) {
-        bool revert_display_config {config::video.dd.config_revert_on_disconnect};
+      std::lock_guard lock {lifecycle_mutex};
+      if (const auto lock_requested = activity.finish(); lock_requested.has_value()) {
+#ifdef _WIN32
+        if (*lock_requested) {
+          platf::lock_workstation();
+        }
+#endif
+        bool revert_display_config {config::video.dd.config_revert_on_disconnect || config::video.dd.configuration_option == config::video_t::dd_t::config_option_e::privacy_screen};
         if (proc::proc.running()) {
 #if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
           system_tray::update_tray_pausing(proc::proc.get_last_run_app_name());
@@ -2371,10 +2388,16 @@ namespace stream {
       session.audioThread = std::jthread {audioThread, &session};
       session.videoThread = std::jthread {videoThread, &session};
 
-      session.state.store(state_e::RUNNING, std::memory_order_relaxed);
+      std::lock_guard lock {lifecycle_mutex};
+#ifdef _WIN32
+      if (!session.clipboard_grant.token.empty()) {
+        session.clipboard_grant.formats.initial_sequence = platf::clipboard_sequence();
+      }
+#endif
+      session.state.store(state_e::RUNNING, std::memory_order_release);
 
       // If this is the first session, invoke the platform callbacks
-      if (++running_sessions == 1) {
+      if (activity.start(session.lock_on_disconnect)) {
         platf::streaming_will_start();
 #if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
         system_tray::update_tray_playing(proc::proc.get_last_run_app_name());
@@ -2394,6 +2417,8 @@ namespace stream {
 
       session->shutdown_event = mail->event<bool>(mail::shutdown);
       session->launch_session_id = launch_session.id;
+      session->lock_on_disconnect = launch_session.lock_on_disconnect;
+      session->clipboard_grant = launch_session.clipboard_grant;
       session->client_cert = launch_session.client_cert;
       session->input_session_id = launch_session.client_cert.empty() ? launch_session.unique_id : launch_session.client_cert;
 

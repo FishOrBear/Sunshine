@@ -14,6 +14,7 @@ extern "C" {
 #include <array>
 #include <cctype>
 #include <format>
+#include <mutex>
 #include <set>
 #include <unordered_map>
 #include <utility>
@@ -24,6 +25,7 @@ extern "C" {
 
 // local includes
 #include "config.h"
+#include "display_device.h"
 #include "globals.h"
 #include "input.h"
 #include "logging.h"
@@ -544,21 +546,29 @@ namespace rtsp_stream {
      * @param launch_session Streaming session information.
      */
     void session_raise(std::shared_ptr<launch_session_t> launch_session) {
+      std::lock_guard lock {launch_mutex};
       // If a launch event is still pending, don't overwrite it.
       if (launch_event.view(0s)) {
         return;
       }
 
       // Raise the new launch session to prepare for the RTSP handshake
+      const auto pending_id = launch_session->id;
       launch_event.raise(std::move(launch_session));
 
       // Arm the timer to expire this launch session if the client times out
       raised_timer.expires_after(config::stream.ping_timeout);
-      raised_timer.async_wait([this](const boost::system::error_code &ec) {
+      raised_timer.async_wait([this, pending_id](const boost::system::error_code &ec) {
         if (!ec) {
-          auto discarded = launch_event.pop(0s);
-          if (discarded) {
-            BOOST_LOG(debug) << "Event timeout: "sv << discarded->unique_id;
+          auto slots_lock = _session_slots.lock();
+          std::lock_guard lock {launch_mutex};
+          auto pending = launch_event.view(0s);
+          if (pending && pending->id == pending_id) {
+            launch_event.pop();
+            BOOST_LOG(debug) << "Event timeout: "sv << pending->unique_id;
+            if (_session_slots->empty() && config::video.dd.configuration_option == config::video_t::dd_t::config_option_e::privacy_screen) {
+              display_device::revert_configuration();
+            }
           }
         }
       });
@@ -569,6 +579,7 @@ namespace rtsp_stream {
      * @param launch_session_id The ID of the session to clear.
      */
     void session_clear(uint32_t launch_session_id) {
+      std::lock_guard lock {launch_mutex};
       // We currently only support a single pending RTSP session,
       // so the ID should always match the one for that session.
       auto launch_session = launch_event.view(0s);
@@ -589,6 +600,27 @@ namespace rtsp_stream {
     int session_count() {
       auto lg = _session_slots.lock();
       return (int) _session_slots->size();
+    }
+
+    /**
+     * @brief Wait for timeout cleanup before allowing another display preparation.
+     * @return True when the pending RTSP slot is occupied.
+     */
+    bool session_pending() {
+      std::lock_guard lock {launch_mutex};
+      return static_cast<bool>(launch_event.view(0s));
+    }
+
+    /** @brief Check both the paired TLS identity and the per-stream capability. */
+    clipboard::formats_t clipboard_formats(std::string_view cert, std::string_view token) {
+      auto lg = _session_slots.lock();
+      for (const auto &slot : *_session_slots) {
+        const auto &grant = stream::session::clipboard_grant(*slot);
+        if (grant.matches(token) && stream::session::state(*slot) == stream::session::state_e::RUNNING && stream::session::client_cert(*slot) == cert && !cert.empty()) {
+          return grant.formats;
+        }
+      }
+      return {};
     }
 
     safe::event_t<std::shared_ptr<launch_session_t>> launch_event;  ///< Launch event.
@@ -662,6 +694,13 @@ namespace rtsp_stream {
       // 500ms to allow session cleanup to happen.
       if (session_count() > 0) {
         io_context.run_one_for(500ms);
+        if (config::video.dd.configuration_option == config::video_t::dd_t::config_option_e::privacy_screen && std::chrono::steady_clock::now() >= next_privacy_check) {
+          next_privacy_check = std::chrono::steady_clock::now() + 500ms;
+          if (!display_device::privacy_screen_active()) {
+            BOOST_LOG(warning) << "Ending private streams because the virtual display is no longer the only active output.";
+            clear();
+          }
+        }
       } else {
         io_context.run_one();
       }
@@ -684,6 +723,8 @@ namespace rtsp_stream {
     boost::asio::io_context io_context;
     tcp::acceptor acceptor {io_context};
     boost::asio::steady_timer raised_timer {io_context};
+    std::mutex launch_mutex;  ///< Protects the pending handshake, its timer, and timeout rollback.
+    std::chrono::steady_clock::time_point next_privacy_check {};  ///< Deadline for rechecking display topology during a private stream.
 
     std::shared_ptr<socket_t> next_socket;
   };
@@ -701,11 +742,19 @@ namespace rtsp_stream {
     server.session_clear(launch_session_id);
   }
 
+  bool launch_session_pending() {
+    return server.session_pending();
+  }
+
   int session_count() {
     // Ensure session_count is up-to-date
     server.clear(false);
 
     return server.session_count();
+  }
+
+  clipboard::formats_t clipboard_formats(std::string_view cert, std::string_view token) {
+    return server.clipboard_formats(cert, token);
   }
 
   void terminate_sessions() {
@@ -1250,6 +1299,17 @@ namespace rtsp_stream {
       BOOST_LOG(error) << "Rejecting client that cannot comply with mandatory encryption requirement"sv;
 
       respond(sock, session, &option, 403, "Forbidden", req->sequenceNumber, {});
+      return;
+    }
+
+    // A socket accepted before an RTSP timeout may outlive its launch request.
+    const auto pending = rtsp_server->launch_event.view(0s);
+    if (!pending || pending->id != session.id) {
+      respond(sock, session, &option, 454, "Session Not Found", req->sequenceNumber, {});
+      return;
+    }
+    if (config::video.dd.configuration_option == config::video_t::dd_t::config_option_e::privacy_screen && !display_device::privacy_screen_active()) {
+      respond(sock, session, &option, 503, "Privacy screen unavailable", req->sequenceNumber, {});
       return;
     }
 

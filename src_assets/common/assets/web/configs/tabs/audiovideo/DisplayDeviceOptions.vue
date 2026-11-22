@@ -74,7 +74,15 @@ function addRemappingEntry() {
                   <option value="ensure_active">{{ $t('config.dd_config_ensure_active') }}</option>
                   <option value="ensure_primary">{{ $t('config.dd_config_ensure_primary') }}</option>
                   <option value="ensure_only_display">{{ $t('config.dd_config_ensure_only_display') }}</option>
+                  <option value="privacy_screen">{{ $t('config.dd_config_privacy_screen') }}</option>
                 </select>
+                <div v-if="config.dd_configuration_option === 'privacy_screen'" class="form-text">
+                  {{ $t('config.dd_config_privacy_screen_desc') }}
+                </div>
+              </div>
+
+              <div class="mb-3">
+                <Checkbox id="lock_on_disconnect" locale-prefix="config" v-model="config.lock_on_disconnect" default="false" />
               </div>
 
               <!-- Resolution option -->
@@ -160,7 +168,7 @@ function addRemappingEntry() {
               </div>
 
               <!-- Config revert on disconnect -->
-              <div class="mb-3" v-if="config.dd_configuration_option !== 'disabled'">
+              <div class="mb-3" v-if="!['disabled', 'privacy_screen'].includes(config.dd_configuration_option)">
                 <Checkbox id="dd_config_revert_on_disconnect"
                   locale-prefix="config"
                   v-model="config.dd_config_revert_on_disconnect"

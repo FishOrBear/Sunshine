@@ -1299,6 +1299,12 @@ namespace platf {
     }
   }
 
+  void lock_workstation() {
+    if (!LockWorkStation()) {
+      BOOST_LOG(warning) << "Windows did not accept the workstation lock request: " << GetLastError();
+    }
+  }
+
   void streaming_will_stop() {
     // Demote ourselves back to normal priority class
     SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);

@@ -167,7 +167,8 @@ namespace config {
         verify_only,  ///< @seealso{display_device::SingleDisplayConfiguration::DevicePreparation}
         ensure_active,  ///< @seealso{display_device::SingleDisplayConfiguration::DevicePreparation}
         ensure_primary,  ///< @seealso{display_device::SingleDisplayConfiguration::DevicePreparation}
-        ensure_only_display  ///< @seealso{display_device::SingleDisplayConfiguration::DevicePreparation}
+        ensure_only_display,  ///< @seealso{display_device::SingleDisplayConfiguration::DevicePreparation}
+        privacy_screen  ///< Require an exclusive Windows indirect virtual display before allowing streaming.
       };
 
       /**
@@ -223,6 +224,7 @@ namespace config {
       hdr_option_e hdr_option;  ///< HDR-selection mode selected by configuration.
       std::chrono::milliseconds config_revert_delay;  ///< Time to wait until settings are reverted (after stream ends/app exists).
       bool config_revert_on_disconnect;  ///< Specify whether to revert display configuration on client disconnect.
+      bool lock_on_disconnect;  ///< Lock the Windows desktop after the last streaming client disconnects.
       mode_remapping_t mode_remapping;  ///< Display mode remapping rules grouped by automatic selection mode.
       workarounds_t wa;  ///< Display-device compatibility workarounds.
     };
@@ -293,6 +295,8 @@ namespace config {
     std::string file_state;  ///< Path to the persisted Sunshine state file.
 
     std::string external_ip;  ///< External address advertised to clients when configured.
+    bool clipboard_text {};  ///< Allow paired streams to exchange text on Windows.
+    bool clipboard_files {};  ///< Allow paired streams to exchange copied files on Windows.
   };
 
   /**

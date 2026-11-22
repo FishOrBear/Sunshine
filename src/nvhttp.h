@@ -102,6 +102,9 @@ namespace nvhttp {
         SimpleWeb::HTTPS(io_context, ctx) {
     }
 
+    std::string client_cert;  ///< Verified peer certificate bound to this TLS connection.
+    std::string client_name;  ///< Paired name of the same authenticated peer.
+
     virtual ~SunshineHTTPS() {
       // Gracefully shutdown the TLS connection
       SimpleWeb::error_code ec;

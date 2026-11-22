@@ -1049,6 +1049,13 @@ namespace platf {
   void streaming_will_start();
   void streaming_will_stop();
 
+#ifdef _WIN32
+  /**
+   * @brief Ask Windows to lock the interactive desktop hosting the stream.
+   */
+  void lock_workstation();
+#endif
+
   void restart();
 
   /**
