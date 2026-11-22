@@ -83,6 +83,38 @@ TEST_F(ClientAuthorizationTest, CanonicalIdentityFailsClosedAndTracksEnableState
   EXPECT_TRUE(nvhttp::test_support::authorize_client_certificate(paired_credentials.x509));
 }
 
+#ifdef _WIN32
+TEST_F(ClientAuthorizationTest, StandaloneFilesRequireEnabledPairingAndCurrentHostConsent) {
+  const auto certificate = test_utils::certificates::generate_ca_credentials().x509;
+  const auto uuid = nvhttp::test_support::add_client("file-only", certificate, true);
+  ASSERT_FALSE(uuid.empty());
+  const auto original = config::nvhttp.file_browser;
+  const std::string token(64, 'e');
+  using namespace nvhttp::test_support;
+  config::nvhttp.file_browser = false;
+  EXPECT_EQ(change_file_connection(certificate, token, false), 403);
+  config::nvhttp.file_browser = true;
+  EXPECT_EQ(change_file_connection("", token, false), 403);
+  EXPECT_EQ(change_file_connection(certificate, "bad", false), 400);
+  EXPECT_EQ(change_file_connection(certificate, token, false), 204);
+  EXPECT_TRUE(has_file_connection(certificate, token));
+  config::nvhttp.file_browser = false;
+  EXPECT_FALSE(has_file_connection(certificate, token));
+  config::nvhttp.file_browser = true;
+  EXPECT_TRUE(nvhttp::set_client_enabled(uuid, false));
+  EXPECT_FALSE(has_file_connection(certificate, token));
+  EXPECT_EQ(change_file_connection(certificate, token, false), 403);
+  EXPECT_TRUE(nvhttp::set_client_enabled(uuid, true));
+  EXPECT_FALSE(has_file_connection(certificate, token));
+  EXPECT_EQ(change_file_connection(certificate, token, false), 204);
+  EXPECT_EQ(change_file_connection(certificate, token, true), 204);
+  EXPECT_EQ(change_file_connection(certificate, token, true), 204);
+  EXPECT_FALSE(has_file_connection(certificate, token));
+  config::nvhttp.file_browser = original;
+}
+
+#endif
+
 TEST_F(ClientAuthorizationTest, DerivedLeafDoesNotInheritPairedAuthorization) {
   const auto paired_credentials = test_utils::certificates::generate_ca_credentials();
   const auto derived_credentials = test_utils::certificates::generate_derived_leaf(paired_credentials);

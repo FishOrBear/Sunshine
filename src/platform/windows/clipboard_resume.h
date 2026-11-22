@@ -8,14 +8,13 @@
 #include "clipboard_upload.h"
 
 #include <mutex>
-#include <openssl/rand.h>
 
 namespace platf::clipboard_upload {
   /** @brief Per-process cache of pinned files. Stream tickets are ordered at negotiation, before any file requests. */
   class resume_cache_t {
   public:
     using clock = std::chrono::steady_clock;  ///< Monotonic clock used for idle expiry.
-    static constexpr auto lifetime = std::chrono::minutes(30);  ///< Maximum idle retention time.
+    static constexpr auto lifetime = file_resume_lifetime;  ///< Maximum idle retention time.
 
     /** @brief Remove expired files even if the client never returns. */
     void expire(clock::time_point now) {
@@ -127,7 +126,7 @@ namespace platf::clipboard_upload {
         }
         return {204};
       }
-      auto lease = new_lease();
+      auto lease = new_file_lease();
       if (lease.empty()) {
         return {500};
       }
@@ -178,21 +177,6 @@ namespace platf::clipboard_upload {
       std::erase_if(records, [&](const auto &record) {
         return now - record.touched >= lifetime;
       });
-    }
-
-    /** @brief Return an unpredictable lower-case hexadecimal lease. */
-    static std::string new_lease() {
-      std::array<unsigned char, 16> bytes {};
-      if (RAND_bytes(bytes.data(), static_cast<int>(bytes.size())) != 1) {
-        return {};
-      }
-      constexpr std::string_view hex = "0123456789abcdef";
-      std::string lease;  ///< Random identifier rotated by every resume.
-      for (auto b : bytes) {
-        lease.push_back(hex[b >> 4]);
-        lease.push_back(hex[b & 15]);
-      }
-      return lease;
     }
 
     /** @brief Remove empty GUID directories left after Windows closed the interrupted process's delete-pending files. */

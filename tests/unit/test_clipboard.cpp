@@ -14,6 +14,7 @@
   #include "src/platform/windows/clipboard_resume.h"
   #include "src/platform/windows/clipboard_upload.h"
   #include "src/platform/windows/clipboard_win32.h"
+  #include "src/platform/windows/file_sessions.h"
 
   #include <thread>
 #endif
@@ -34,6 +35,17 @@ TEST(ClipboardGrantTest, RequiresMutualConsentAndValidCapability) {
     EXPECT_FALSE(grant.matches(invalid));
     EXPECT_FALSE(grant.formats.matches_any());
   }
+}
+
+TEST(ClipboardGrantTest, FileBrowserRequiresSeparateBilateralPermission) {
+  const std::string token(64, 'd');
+  const clipboard::formats_t browser {false, false, 0, true};
+  const clipboard::formats_t copied {false, true};
+  EXPECT_TRUE(clipboard::negotiate(browser, browser, token).formats.browser);
+  EXPECT_FALSE(clipboard::negotiate(browser, browser, token).formats.matches_any());
+  EXPECT_FALSE(clipboard::negotiate(copied, browser, token).formats.browser);
+  EXPECT_FALSE(clipboard::negotiate(browser, copied, token).formats.browser);
+  EXPECT_FALSE(clipboard::negotiate(browser, browser, "bad").formats.browser);
 }
 
 TEST(ClipboardGrantTest, DisclosesOnlyNewCopiesAfterSessionStartup) {
@@ -91,6 +103,132 @@ TEST(ClipboardCodecTest, RejectsDisallowedOrMalformedWritesBeforeOpeningClipboar
   EXPECT_EQ(win_clipboard::write(true, true, std::string("T\xff", 2), sequence, {}), 400);
   EXPECT_EQ(win_clipboard::write(true, true, std::string(win_clipboard::max_text + 2, 'T'), sequence, {}), 413);
   EXPECT_EQ(win_clipboard::write(true, true, std::string(win_clipboard::max_body + 1, 'F'), sequence, {}), 413);
+}
+
+TEST(FileSessionTest, BindRenewExpireAndCloseWithoutStreaming) {
+  file_sessions::registry_t sessions;
+  const std::string token(64, 'a');
+  const auto now = file_sessions::registry_t::clock::now();
+  const auto timeout = file_sessions::registry_t::idle_timeout;
+  EXPECT_EQ(sessions.open("a", "short", now), 400);
+  EXPECT_EQ(sessions.open("", "", now), 400);
+  ASSERT_EQ(sessions.open("a", token, now), 204);
+  auto first = sessions.find("a", token, now);
+  ASSERT_TRUE(first);
+  EXPECT_FALSE(sessions.find("b", token, now));
+  sessions.close("b", token);
+  EXPECT_EQ(sessions.open("a", token, now + timeout / 2), 204);
+  EXPECT_EQ(sessions.find("a", token, now + timeout), first);
+  std::weak_ptr<platf::file_browser_session_t> released = first;
+  first.reset();
+  sessions.expire(now + timeout * 2);
+  EXPECT_TRUE(released.expired());
+  EXPECT_FALSE(sessions.find("a", token, now + timeout * 2));
+  EXPECT_EQ(sessions.open("a", token, now + timeout * 2), 204);
+  sessions.close("a", token);
+  sessions.close("a", token);
+  EXPECT_FALSE(sessions.find("a", token, now + timeout * 2));
+}
+
+TEST(FileSessionTest, LimitsEachPairingAndTotalWithoutEvictingAnActiveTransfer) {
+  file_sessions::registry_t sessions;
+  for (int i = 0; i < 8; ++i) {
+    for (int n = 0; n < 4; ++n) {
+      ASSERT_EQ(sessions.open(std::to_string(i), std::string(64, 'a' + n)), 204);
+    }
+    EXPECT_EQ(sessions.open(std::to_string(i), std::string(64, 'e')), 429);
+  }
+  const std::string token(64, 'a');
+  EXPECT_EQ(sessions.open("another", token), 429);
+  EXPECT_TRUE(sessions.find("0", token));
+  sessions.revoke("0");
+  EXPECT_FALSE(sessions.find("0", token));
+  EXPECT_TRUE(sessions.find("1", token));
+  EXPECT_EQ(sessions.open("another", token), 204);
+  sessions.revoke();
+  EXPECT_FALSE(sessions.find("1", token));
+}
+
+TEST(FileBrowserTest, RequiresValidCapabilityAndWriteBounds) {
+  auto session = platf::make_file_browser_session();
+  std::string out;
+  const auto denied = []() {
+    return false;
+  };
+  EXPECT_EQ(platf::exchange_files(*session, "list", "", "", 0, 0, {}, {}, out, denied), 403);
+  EXPECT_EQ(platf::exchange_files(*session, "write", "", "bad", 0, 0, {}, {}, out, denied), 400);
+  EXPECT_EQ(platf::exchange_files(*session, "read", "", "", 10, 9, {}, {}, out, denied), 400);
+  EXPECT_EQ(platf::exchange_files(*session, "read", "", "", 0, UINT64_MAX, {}, {}, out, denied), 400);
+}
+
+TEST(FileBrowserTest, CopiesInChunksAndCleansAbandonedUploads) {
+  namespace fs = std::filesystem;
+  auto session = platf::make_file_browser_session();
+  std::string out;
+  const std::string id(32, 'e');
+  const auto active = []() {
+    return true;
+  };
+  const auto op = [&](std::string_view action, const fs::path &path, std::uint64_t offset = 0, std::uint64_t size = 0, std::string_view body = {}) {
+    out.clear();
+    return platf::exchange_files(*session, action, win_clipboard::detail::to_utf8(path.generic_wstring()), id, offset, size, {}, body, out, active);
+  };
+  const auto drives = op("list", {});
+  if (drives == 403) {
+    GTEST_SKIP() << "This test needs an unlocked interactive Windows desktop";
+  }
+  ASSERT_EQ(drives, 200);
+  EXPECT_NE(out.find("entries"), std::string::npos);
+  ASSERT_EQ(op("places", {}), 200);
+  const auto places = nlohmann::json::parse(out).at("entries");
+  ASSERT_TRUE(places.is_array());
+  ASSERT_LE(places.size(), 32);
+  EXPECT_FALSE(places.empty());
+  for (const auto &place : places) {
+    EXPECT_TRUE(place.at("name").is_string());
+    EXPECT_TRUE(place.at("kind").is_string());
+    EXPECT_TRUE(fs::path(win_clipboard::detail::from_utf8(place.at("path").get<std::string>())).is_absolute());
+  }
+  GUID guid {};
+  ASSERT_EQ(CoCreateGuid(&guid), S_OK);
+  wchar_t unique[40] {};
+  ASSERT_TRUE(StringFromGUID2(guid, unique, 40));
+  const auto dir = fs::temp_directory_path() / unique;
+  ASSERT_EQ(op("mkdir", dir), 204);
+
+  struct cleanup_t {
+    fs::path directory;
+
+    ~cleanup_t() {
+      std::error_code ec;
+      fs::remove_all(directory, ec);
+    }
+  } cleanup {dir};
+
+  EXPECT_EQ(op("mkdir", dir), 409);
+  const auto target = dir / L"copied + file.txt";
+  EXPECT_EQ(op("write", target, 0, 5, "ab"), 204);
+  EXPECT_FALSE(fs::exists(target));
+  EXPECT_EQ(op("write", target, 1, 5, "cd"), 409);
+  EXPECT_EQ(op("write", target, 2, 5, "cde"), 204);
+  EXPECT_EQ(op("read", target, 0, 5), 200);
+  EXPECT_EQ(out, "abcde");
+  EXPECT_EQ(op("read", target, 2, 5), 200);
+  EXPECT_EQ(out, "cde");
+  EXPECT_EQ(op("read", target, 0, 4), 409);
+  EXPECT_EQ(op("write", target, 0, 0), 409);
+  EXPECT_EQ(op("list", dir), 200);
+  EXPECT_NE(out.find("copied + file.txt"), std::string::npos);
+  EXPECT_EQ(op("write", dir / "second", 0, 2, "x"), 204);
+  EXPECT_EQ(op("abort", {}), 204);
+  EXPECT_EQ(op("write", dir / "second", 1, 2, "y"), 409);
+  EXPECT_FALSE(fs::exists(dir / "second"));
+  EXPECT_EQ(op("write", dir / "empty", 0, 0), 204);
+  EXPECT_EQ(op("read", dir / "empty", 0, 0), 200);
+  EXPECT_TRUE(out.empty());
+  EXPECT_EQ(op("write", dir / "third", 0, 2, "x"), 204);
+  session.reset();
+  EXPECT_EQ(std::distance(fs::directory_iterator(dir), fs::directory_iterator()), 2);
 }
 
 TEST(ClipboardBatchTest, RejectsInvalidManifestsAndUses64BitLengths) {

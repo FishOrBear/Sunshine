@@ -131,6 +131,14 @@ watch(
               default="false"
     ></Checkbox>
 
+    <Checkbox v-if="platform === 'windows'"
+              class="mb-3"
+              id="file_browser"
+              locale-prefix="config"
+              v-model="config.file_browser"
+              default="true"
+    ></Checkbox>
+
     <!-- Enable Gamepad Input -->
     <Checkbox class="mb-3"
               id="controller"

@@ -453,6 +453,12 @@ namespace nvhttp {
      * @return `true` when the exact certificate belongs to one enabled paired client.
      */
     bool authorize_client_certificate(std::string_view cert);
+  #ifdef _WIN32
+    /** @brief Exercise the file-only open/close permissions without starting a listener or stream. */
+    int change_file_connection(const std::string &cert, const std::string &token, bool close);
+    /** @brief Resolve the file data path using its actual grant and pairing checks. */
+    bool has_file_connection(const std::string &cert, const std::string &token);
+  #endif
 
     /**
      * @brief Complete and remove a pairing session without running the protocol phases.
