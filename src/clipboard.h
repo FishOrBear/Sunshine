@@ -14,7 +14,8 @@
 
 namespace platf {
   struct clipboard_upload_session_t;
-}
+  struct file_browser_session_t;
+}  // namespace platf
 
 namespace clipboard {
   /**
@@ -24,6 +25,9 @@ namespace clipboard {
     bool text {};  ///< Plain UTF-8 text.
     bool files {};  ///< Regular local files.
     std::uint32_t initial_sequence {};  ///< Clipboard contents already present before this stream started.
+
+    bool browser {};  ///< Allow directory listing and explicit file transfers.
+    std::shared_ptr<platf::file_browser_session_t> browser_session {};  ///< Pending transfers owned by this stream.
 
     std::shared_ptr<platf::clipboard_upload_session_t> upload_session {};  ///< One in-progress clipboard batch, owned by this stream.
 
@@ -53,12 +57,18 @@ namespace clipboard {
     }
   };
 
+  /** @brief Check a client capability encoded as exactly 32 hexadecimal bytes. */
+  inline bool valid_token(std::string_view token) {
+    return token.size() == 64 && std::all_of(token.begin(), token.end(), [](char c) {
+             return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+           });
+  }
+
   /** @brief Negotiate a grant only for explicitly enabled formats and a well-formed token. */
   inline grant_t negotiate(formats_t host, formats_t client, std::string token) {
     formats_t formats {host.text && client.text, host.files && client.files};
-    if ((!formats.text && !formats.files) || token.size() != 64 || !std::all_of(token.begin(), token.end(), [](char c) {
-          return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
-        })) {
+    formats.browser = host.browser && client.browser;
+    if ((!formats.matches_any() && !formats.browser) || !valid_token(token)) {
       return {};
     }
     return {std::move(token), formats};

@@ -11,6 +11,7 @@
 #include <atomic>
 #include <charconv>
 #include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <format>
 #include <mutex>
@@ -38,6 +39,7 @@
 #include "platform/common.h"
 #ifdef _WIN32
   #include "platform/windows/clipboard.h"
+  #include "platform/windows/file_sessions.h"
 #endif
 #include "process.h"
 #include "rtsp.h"
@@ -499,7 +501,10 @@ namespace nvhttp {
 
   /** @brief Acknowledge only the clipboard formats enabled on both peers. */
   void advertise_clipboard(pt::ptree &tree, const clipboard::grant_t &grant) {
-    if (!grant.token.empty()) {
+    if (grant.formats.browser) {
+      tree.put("root.filebrowserversion", 1);
+    }
+    if (grant.formats.matches_any()) {
       tree.put("root.clipboardversion", 1);
       tree.put("root.clipboardtext", grant.formats.text ? 1 : 0);
       tree.put("root.clipboardfiles", grant.formats.files ? 1 : 0);
@@ -572,13 +577,16 @@ namespace nvhttp {
 #ifdef _WIN32
     if (!identity.first.empty()) {
       launch_session->clipboard_grant = clipboard::negotiate(
-        {config::nvhttp.clipboard_text, config::nvhttp.clipboard_files},
-        {get_arg(args, "clipboardtext", "0") == "1", get_arg(args, "clipboardfiles", "0") == "1"},
+        {config::nvhttp.clipboard_text, config::nvhttp.clipboard_files, 0, config::nvhttp.file_browser},
+        {get_arg(args, "clipboardtext", "0") == "1", get_arg(args, "clipboardfiles", "0") == "1", 0, get_arg(args, "filebrowser", "0") == "1"},
         get_arg(args, "clipboardtoken", "")
       );
       if (launch_session->clipboard_grant.formats.files) {
         launch_session->clipboard_grant.formats.resumable = get_arg(args, "clipboardbatchversion", "") == "2";
         launch_session->clipboard_grant.formats.upload_session = platf::make_clipboard_upload_session(identity.first);
+      }
+      if (launch_session->clipboard_grant.formats.browser) {
+        launch_session->clipboard_grant.formats.browser_session = platf::make_file_browser_session();
       }
     }
 #endif
@@ -1296,7 +1304,7 @@ namespace nvhttp {
    * @param request HTTP request data from the client.
    */
   template<class T>
-  void serverinfo(std::shared_ptr<typename SimpleWeb::ServerBase<T>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<T>::Request> request) {
+  void serverinfo(std::shared_ptr<typename SimpleWeb::ServerBase<T>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<T>::Request> request, bool standalone_files = false) {
     print_req<T>(request);
 
     int pair_status = 0;
@@ -1326,6 +1334,9 @@ namespace nvhttp {
     // Only include the MAC address for requests sent from paired clients over HTTPS.
     // For HTTP requests, use a placeholder MAC address that Moonlight knows to ignore.
     if constexpr (std::is_same_v<SunshineHTTPS, T>) {
+      if (standalone_files) {
+        tree.put("root.standalonefileversion", 1);
+      }
       tree.put("root.mac", platf::get_mac_address(net::addr_to_normalized_string(local_endpoint.address())));
     } else {
       tree.put("root.mac", "00:00:00:00:00:00");
@@ -1721,6 +1732,116 @@ namespace nvhttp {
   }
 
 #ifdef _WIN32
+  /** @brief Keep file-only grants separate from active GameStream sessions. */
+  file_sessions::registry_t &standalone_sessions() {
+    static file_sessions::registry_t registry;
+    return registry;
+  }
+
+  /** @brief Revalidate the verified TLS peer against the current pairing database. */
+  bool paired_client_enabled(const std::string &pem) {
+    if (pem.empty()) {
+      return false;
+    }
+    auto cert = crypto::x509(pem);
+    std::lock_guard lock {client_auth_mutex()};
+    return cert && is_client_enabled(cert.get());
+  }
+
+  /** @brief Authenticate a file-only connection and bind its staging state to the verified certificate. */
+  int change_file_session(const std::string &cert, const std::string &token, bool close) {
+    if (!clipboard::valid_token(token)) {
+      return 400;
+    }
+    auto x509 = crypto::x509(cert);
+    std::lock_guard lock {client_auth_mutex()};
+    if (!x509 || !is_client_enabled(x509.get()) || (!close && !config::nvhttp.file_browser)) {
+      return 403;
+    }
+    if (!close) {
+      return standalone_sessions().open(cert, token);
+    }
+    standalone_sessions().close(cert, token);
+    return 204;
+  }
+
+  /** @brief Open or close a file-only session without launching an application or allocating a stream. */
+  void handle_file_session(resp_https_t response, req_https_t request, const std::string &cert, bool close) {
+    using status = SimpleWeb::StatusCode;
+    const auto header = request->header.find("X-Moonlight-File-Session");
+    const auto token = request->header.find("X-Clipboard-Token");
+    if (header == request->header.end() || header->second != "1" || request->header.count("X-Moonlight-File-Session") != 1 || token == request->header.end() || request->header.count("X-Clipboard-Token") != 1 || request->content.size() != 0) {
+      response->write(status::client_error_bad_request);
+      return;
+    }
+    response->write(static_cast<status>(change_file_session(cert, token->second, close)), SimpleWeb::CaseInsensitiveMultimap {{"Cache-Control", "no-store"}});
+  }
+
+  /** @brief Resolve an explicit file connection or a negotiated stream's file grant. */
+  std::shared_ptr<platf::file_browser_session_t> file_session(const std::string &cert, const std::string &token) {
+    if (!config::nvhttp.file_browser || !clipboard::valid_token(token) || !paired_client_enabled(cert)) {
+      return {};
+    }
+    if (auto standalone = standalone_sessions().find(cert, token)) {
+      return standalone;
+    }
+    return rtsp_stream::clipboard_formats(cert, token).browser_session;
+  }
+
+  /** @brief Authorize a directory or transfer request against a live file grant. */
+  void handle_files(resp_https_t response, req_https_t request, const std::string &cert) {
+    using status = SimpleWeb::StatusCode;
+    const auto token = request->header.find("X-Clipboard-Token");
+    const auto session = token == request->header.end() || request->header.count("X-Clipboard-Token") != 1 ? nullptr : file_session(cert, token->second);
+    if (!session) {
+      response->write(status::client_error_forbidden);
+      return;
+    }
+    const auto active = [&]() {
+      return file_session(cert, token->second) == session;
+    };
+    const auto op = request->path.substr(7);
+    const auto args = request->parse_query_string();
+    const auto parse = [](const std::string &arg, auto &out) {
+      const auto end = arg.data() + arg.size();
+      const auto parsed = std::from_chars(arg.data(), end, out);
+      return parsed.ec == std::errc {} && parsed.ptr == end;
+    };
+    std::uint64_t offset {}, size {};
+    std::optional<std::int64_t> modified;
+    const auto timestamp = get_arg(args, "modified", "");
+    const bool chunk = op == "write" || op == "read" || op == "chunk";
+    if ((chunk && !parse(get_arg(args, "offset", ""), offset)) ||
+        ((chunk || op == "resume" || op == "identity") && !parse(get_arg(args, "size", ""), size))) {
+      response->write(status::client_error_bad_request);
+      return;
+    }
+    if (!timestamp.empty() && !parse(timestamp, modified.emplace())) {
+      response->write(status::client_error_bad_request);
+      return;
+    }
+    if (request->content.size() > ((op == "write" || op == "chunk") ? 1024U * 1024U : 0U)) {
+      response->write(status::client_error_payload_too_large);
+      return;
+    }
+    try {
+      std::string payload;
+      std::optional<std::uint64_t> ack;
+      const auto result = platf::exchange_files(*session, op, get_arg(args, "path", ""), get_arg(args, "id", ""), offset, size, modified, request->content.string(), payload, active, cert, get_arg(args, "sha256", ""), &ack);
+      if ((result == 200 || result == 202) && !active()) {
+        response->write(status::client_error_forbidden);
+        return;
+      }
+      SimpleWeb::CaseInsensitiveMultimap headers {{"Cache-Control", "no-store"}, {"Content-Type", op == "read" ? "application/octet-stream" : "application/json"}};
+      if (ack) {
+        headers.emplace("X-File-Offset", std::to_string(*ack));
+      }
+      response->write(static_cast<status>(result), payload, headers);
+    } catch (const std::exception &) {
+      response->write(status::server_error_internal_server_error);
+    }
+  }
+
   /** @brief Read a complete decimal unsigned integer without accepting prefixes or trailing characters. */
   template<class UInt>
   bool parse_clipboard_number(std::string_view str, UInt &value) {
@@ -1979,7 +2100,15 @@ namespace nvhttp {
     };
 
     https_server.default_resource["GET"] = not_found<SunshineHTTPS>;
-    https_server.resource["^/serverinfo$"]["GET"] = serverinfo<SunshineHTTPS>;
+    https_server.resource["^/serverinfo$"]["GET"] = [&](auto resp, auto req) {
+      bool standalone_files = false;
+#ifdef _WIN32
+      if (config::nvhttp.file_browser && paired_client_enabled(https_server.client_identity(*req).first)) {
+        standalone_files = config::nvhttp.file_browser;
+      }
+#endif
+      serverinfo<SunshineHTTPS>(resp, req, standalone_files);
+    };
     https_server.resource["^/pair$"]["GET"] = [](auto resp, auto req) {
       pair<SunshineHTTPS>(resp, req);
     };
@@ -1994,6 +2123,18 @@ namespace nvhttp {
     https_server.resource["^/cancel$"]["GET"] = cancel;
 
 #ifdef _WIN32
+    https_server.resource["^/files/session$"]["POST"] = [&](auto resp, auto req) {
+      handle_file_session(resp, req, https_server.client_identity(*req).first, false);
+    };
+    https_server.resource["^/files/session/end$"]["POST"] = [&](auto resp, auto req) {
+      handle_file_session(resp, req, https_server.client_identity(*req).first, true);
+    };
+    for (const auto *op : {"list", "places", "read", "write", "abort", "mkdir", "capabilities", "identity", "resume", "chunk", "commit", "discard"}) {
+      const auto method = std::string_view(op) == "list" || std::string_view(op) == "places" || std::string_view(op) == "read" || std::string_view(op) == "capabilities" || std::string_view(op) == "identity" ? "GET" : "POST";
+      https_server.resource["^/files/"s + op + "$"][method] = [&](auto resp, auto req) {
+        handle_files(resp, req, https_server.client_identity(*req).first);
+      };
+    }
     // Bound the TLS server's buffering before the request reaches a clipboard handler.
     https_server.config.max_request_streambuf_size = 16 * 1024 * 1024;
     https_server.resource["^/clipboard/batch$"]["POST"] = [&](auto resp, auto req) {
@@ -2010,7 +2151,9 @@ namespace nvhttp {
     https_server.config.port = port_https;
 
     http_server.default_resource["GET"] = not_found<SimpleWeb::HTTP>;
-    http_server.resource["^/serverinfo$"]["GET"] = serverinfo<SimpleWeb::HTTP>;
+    http_server.resource["^/serverinfo$"]["GET"] = [](auto resp, auto req) {
+      serverinfo<SimpleWeb::HTTP>(resp, req);
+    };
     http_server.resource["^/pair$"]["GET"] = [](auto resp, auto req) {
       pair<SimpleWeb::HTTP>(resp, req);
     };
@@ -2041,7 +2184,9 @@ namespace nvhttp {
     // Wait for any event
 #ifdef _WIN32
     while (!shutdown_event->view(std::chrono::minutes(1))) {
+      standalone_sessions().expire();
       platf::expire_clipboard_uploads();
+      platf::expire_file_transfers();
     }
 #else
     shutdown_event->view();
@@ -2052,10 +2197,16 @@ namespace nvhttp {
 
     ssl.join();
     tcp.join();
+#ifdef _WIN32
+    standalone_sessions().revoke();
+#endif
   }
 
   void erase_all_clients() {
     std::lock_guard lock {client_auth_mutex()};
+#ifdef _WIN32
+    standalone_sessions().revoke();
+#endif
     client_root = {};
     cert_chain.clear();
     save_state();
@@ -2066,6 +2217,9 @@ namespace nvhttp {
     bool removed = false;
     for (auto it = client_root.named_devices.begin(); it != client_root.named_devices.end();) {
       if ((*it).uuid == uuid) {
+#ifdef _WIN32
+        standalone_sessions().revoke(it->cert);
+#endif
         it = client_root.named_devices.erase(it);
         removed = true;
       } else {
@@ -2082,6 +2236,11 @@ namespace nvhttp {
     std::lock_guard lock {client_auth_mutex()};
     for (auto &named_cert : client_root.named_devices) {
       if (named_cert.uuid == uuid) {
+#ifdef _WIN32
+        if (!enabled) {
+          standalone_sessions().revoke(named_cert.cert);
+        }
+#endif
         named_cert.enabled = enabled;
         rebuild_client_cert_chain();
         save_state();
@@ -2144,6 +2303,17 @@ namespace nvhttp {
     ) {
       pair<SimpleWeb::HTTP>(std::move(response), std::move(request));
     }
+
+  #ifdef _WIN32
+    int change_file_connection(const std::string &cert, const std::string &token, bool close) {
+      return change_file_session(cert, token, close);
+    }
+
+    bool has_file_connection(const std::string &cert, const std::string &token) {
+      return static_cast<bool>(file_session(cert, token));
+    }
+
+  #endif
 
     void reset_client_state() {
       std::lock_guard lock {client_auth_mutex()};

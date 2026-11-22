@@ -5,10 +5,9 @@
 #pragma once
 
 #include "clipboard_win32.h"
+#include "file_digest.h"
 
-#include <array>
 #include <nlohmann/json.hpp>
-#include <openssl/evp.h>
 
 namespace platf::clipboard_upload {
   namespace fs = std::filesystem;
@@ -23,24 +22,7 @@ namespace platf::clipboard_upload {
     std::uint64_t received {};  ///< Number of bytes written.
     file_handle handle;  ///< Pinned destination file.
     std::string sha256;  ///< Expected content digest for resumable files.
-    std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> hash {nullptr, EVP_MD_CTX_free};
-
-    /** @brief Validate a complete file before it can be published. */
-    bool finish_hash() {
-      std::array<unsigned char, 32> digest {};
-      unsigned int length {};
-      if (!hash || !EVP_DigestFinal_ex(hash.get(), digest.data(), &length) || length != digest.size()) {
-        return false;
-      }
-      hash.reset();
-      constexpr std::string_view hex = "0123456789abcdef";
-      for (size_t i = 0; i < digest.size(); ++i) {
-        if (sha256[2 * i] != hex[digest[i] >> 4] || sha256[2 * i + 1] != hex[digest[i] & 15]) {
-          return false;
-        }
-      }
-      return true;
-    }
+    file_digest_t hash;  ///< Incremental content digest when verification is enabled.
   };
 
   /** @brief Validate all metadata before creating any files. */
@@ -80,7 +62,7 @@ namespace platf::clipboard_upload {
           return 400;
         }
         entry.sha256 = sha->get<std::string>();
-        if (entry.sha256.size() != 64 || entry.sha256.find_first_not_of("0123456789abcdef") != std::string::npos) {
+        if (!file_digest_t::valid(entry.sha256)) {
           return 400;
         }
       }
@@ -204,11 +186,10 @@ namespace platf::clipboard_upload {
       directory_handle.reset(dir);
       for (auto &entry : entries) {
         if (!entry.sha256.empty()) {
-          entry.hash.reset(EVP_MD_CTX_new());
-          if (!entry.hash || !EVP_DigestInit_ex(entry.hash.get(), EVP_sha256(), nullptr)) {
+          if (!entry.hash.start()) {
             return 500;
           }
-          if (!entry.size && !entry.finish_hash()) {
+          if (!entry.size && entry.hash.finish() != entry.sha256) {
             return 422;
           }
         }
@@ -240,11 +221,11 @@ namespace platf::clipboard_upload {
       if (!WriteFile(entry.handle.get(), bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr) || written != bytes.size()) {
         return storage_error();
       }
-      if (entry.hash && !EVP_DigestUpdate(entry.hash.get(), bytes.data(), bytes.size())) {
+      if (entry.hash && !entry.hash.update(bytes)) {
         return 500;
       }
       entry.received += written;
-      if (entry.hash && entry.received == entry.size && !entry.finish_hash()) {
+      if (entry.hash && entry.received == entry.size && entry.hash.finish() != entry.sha256) {
         return 422;
       }
       return 204;

@@ -221,6 +221,28 @@ TEST_F(ConfigPersistenceTest, ParsesFp16SdrGammaEncodedOption) {
 }
 
 /**
+ * @brief File browsing defaults to enabled and obeys its saved override.
+ */
+TEST_F(ConfigPersistenceTest, FileBrowserEnabledByDefaultAndCanBeDisabled) {
+  const auto original_nvhttp = config::nvhttp;
+  const auto restore_nvhttp = util::fail_guard([original_nvhttp]() {
+    config::nvhttp = original_nvhttp;
+  });
+  const auto apps_file = config_file().parent_path() / "sunshine_test_config_apps.json";
+  ASSERT_EQ(file_handler::write_file(apps_file.string().c_str(), "{}"), 0);
+  config::stream.file_apps = apps_file.string();
+
+  config::apply_config_for_test("");
+  EXPECT_TRUE(config::nvhttp.file_browser);
+  EXPECT_FALSE(config::nvhttp.clipboard_files);
+  EXPECT_FALSE(config::nvhttp.clipboard_text);
+  config::apply_config_for_test("file_browser = disabled\n");
+  EXPECT_FALSE(config::nvhttp.file_browser);
+  config::apply_config_for_test("file_browser = enabled\n");
+  EXPECT_TRUE(config::nvhttp.file_browser);
+}
+
+/**
  * @brief Verify the DSCP tagging option parses enabled and disabled values.
  */
 TEST_F(ConfigPersistenceTest, ParsesDscpTaggingOption) {

@@ -7,60 +7,12 @@
 #include "clipboard_resume.h"
 #include "clipboard_upload.h"
 #include "clipboard_win32.h"
+#include "interactive_desktop.h"
 
 #include <atomic>
 #include <mutex>
 
 namespace platf {
-  namespace {
-    /** @brief Release only resources actually acquired by this request. */
-    struct shell_impersonation_t {
-      HANDLE token {};  ///< Token of the interactive shell.
-      bool active {};  ///< Whether to restore the original identity.
-
-      ~shell_impersonation_t() {
-        if (active && !RevertToSelf()) {
-          std::terminate();
-        }
-        if (token) {
-          CloseHandle(token);
-        }
-      }
-
-      /** @brief Impersonate the interactive shell, including when Sunshine runs as SYSTEM. */
-      bool begin() {
-        DWORD pid {};
-        if (!GetWindowThreadProcessId(GetShellWindow(), &pid)) {
-          return false;
-        }
-        HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-        if (!process) {
-          return false;
-        }
-        const bool opened = OpenProcessToken(process, TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_IMPERSONATE, &token);
-        CloseHandle(process);
-        if (!opened || !ImpersonateLoggedOnUser(token)) {
-          return false;
-        }
-        active = true;
-        return true;
-      }
-    };
-
-    /** @brief Refuse clipboard access when Windows is showing a locked or secure desktop. */
-    bool on_user_desktop() {
-      HDESK desktop = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS);
-      if (!desktop) {
-        return false;
-      }
-      wchar_t name[64] {};
-      DWORD needed {};
-      bool result = GetUserObjectInformationW(desktop, UOI_NAME, name, sizeof(name), &needed) &&
-                    CompareStringOrdinal(name, -1, L"Default", -1, TRUE) == CSTR_EQUAL;
-      CloseDesktop(desktop);
-      return result;
-    }
-  }  // namespace
 
   /** @brief Pending and most recently committed batches belong only to this stream. */
   struct clipboard_upload_session_t {
@@ -103,11 +55,11 @@ namespace platf {
   }
 
   clipboard_upload_result_t exchange_clipboard_batch(clipboard_upload_session_t &session, std::string_view op, std::string_view id, std::uint32_t file, std::uint64_t offset, std::optional<std::uint32_t> since, std::string_view input, const std::function<bool()> &grant_active) {
-    shell_impersonation_t user;
+    desktop::shell_impersonation_t user;
     if (!user.begin()) {
       return {409, {}, {}, {}, "shell"};
     }
-    if (!on_user_desktop()) {
+    if (!desktop::on_user_desktop()) {
       return {409, {}, {}, {}, "desktop"};
     }
     TOKEN_STATISTICS stats {};
@@ -214,8 +166,8 @@ namespace platf {
       sequence = formats.initial_sequence;
       return 204;
     }
-    shell_impersonation_t user;
-    if (!user.begin() || !on_user_desktop()) {
+    desktop::shell_impersonation_t user;
+    if (!user.begin() || !desktop::on_user_desktop()) {
       return 409;
     }
     DWORD current = GetClipboardSequenceNumber();

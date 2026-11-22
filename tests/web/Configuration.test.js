@@ -5,6 +5,7 @@ import DisplayDeviceOptions from '../../src_assets/common/assets/web/configs/tab
 import Advanced from '../../src_assets/common/assets/web/configs/tabs/Advanced.vue'
 import General from '../../src_assets/common/assets/web/configs/tabs/General.vue'
 import Inputs from '../../src_assets/common/assets/web/configs/tabs/Inputs.vue'
+import configTabs from '../../src_assets/common/assets/web/configs/config_tabs.json'
 import Network from '../../src_assets/common/assets/web/configs/tabs/Network.vue'
 
 const globalOptions = {
@@ -27,12 +28,24 @@ const globalOptions = {
 }
 
 describe('clipboard settings', () => {
+  it.each(['file_browser'])('enables %s by default and shows its saved opt-out', option => {
+    const defaults = configTabs.find(tab => tab.id === 'input').options
+    expect(defaults[option]).toBe('enabled')
+    const wrapper = mount(Inputs, {
+      props: { platform: 'windows', config: { ...defaults, [option]: 'disabled' } },
+      global: globalOptions,
+    })
+    const checkbox = wrapper.getComponent('#' + option)
+    expect(checkbox.props('modelValue')).toBe('disabled')
+    expect(checkbox.props('default')).toBe('true')
+  })
+
   it.each(['windows', 'linux', 'macos'])('exposes text and file permissions on Windows (%s)', platform => {
     const wrapper = mount(Inputs, {
       props: { platform, config: { clipboard_text: 'disabled', clipboard_files: 'disabled' } },
       global: globalOptions,
     })
-    for (const option of ['clipboard_text', 'clipboard_files']) {
+    for (const option of ['clipboard_text', 'clipboard_files', 'file_browser']) {
       expect(wrapper.find(`#${option}`).exists()).toBe(platform === 'windows')
     }
   })
