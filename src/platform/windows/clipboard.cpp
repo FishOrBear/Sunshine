@@ -4,9 +4,11 @@
  */
 #include "clipboard.h"
 
+#include "clipboard_resume.h"
 #include "clipboard_upload.h"
 #include "clipboard_win32.h"
 
+#include <atomic>
 #include <mutex>
 
 namespace platf {
@@ -62,6 +64,9 @@ namespace platf {
 
   /** @brief Pending and most recently committed batches belong only to this stream. */
   struct clipboard_upload_session_t {
+    std::string cert;  ///< Verified TLS identity that negotiated this stream.
+    std::uint64_t serial {};  ///< Issuance order of streams competing for the same upload.
+    bool resumable {};  ///< Current batch uses the reconnect cache.
     std::mutex mutex;  ///< Serializes begin, append, commit and cancellation.
     std::unique_ptr<clipboard_upload::batch_t> pending;  ///< Partial files removed when the stream is destroyed.
     LUID logon {};  ///< Interactive logon that owns the pinned files.
@@ -69,8 +74,21 @@ namespace platf {
     DWORD last_revision {};  ///< Revision that still identifies the last published batch.
   };
 
-  std::shared_ptr<clipboard_upload_session_t> make_clipboard_upload_session() {
-    return std::make_shared<clipboard_upload_session_t>();
+  static clipboard_upload::resume_cache_t &resume_cache() {
+    static clipboard_upload::resume_cache_t cache;
+    return cache;
+  }
+
+  void expire_clipboard_uploads() {
+    resume_cache().expire(std::chrono::steady_clock::now());
+  }
+
+  std::shared_ptr<clipboard_upload_session_t> make_clipboard_upload_session(std::string cert) {
+    static std::atomic_uint64_t serial {};
+    auto session = std::make_shared<clipboard_upload_session_t>();
+    session->cert = std::move(cert);
+    session->serial = ++serial;
+    return session;
   }
 
   /** @brief Resolve clipboard staging under the impersonated shell owner's local profile. */
@@ -101,6 +119,18 @@ namespace platf {
     if (!grant_active()) {
       return {403};
     }
+    if (op == "resume" || op == "discard" || (session.resumable && op != "begin")) {
+      std::filesystem::path root;
+      if (op == "resume" && clipboard_staging_root(user.token, L"ClipboardUploads", root) != 200) {
+        return {500};
+      }
+      auto result = resume_cache().exchange(root, session.cert, stats.AuthenticationId, session.serial, op, id, file, offset, since, input, grant_active);
+      if (op == "resume" && result.status == 200) {
+        session.resumable = true;
+        session.pending.reset();
+      }
+      return result;
+    }
     if (op == "begin") {
       if (!id.empty()) {
         return {400};
@@ -118,6 +148,7 @@ namespace platf {
       session.logon = stats.AuthenticationId;
       session.last_id.clear();
       session.pending = std::move(batch);
+      session.resumable = false;
       return {200, session.pending->id};
     }
 

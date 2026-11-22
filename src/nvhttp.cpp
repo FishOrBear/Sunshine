@@ -504,7 +504,7 @@ namespace nvhttp {
       tree.put("root.clipboardtext", grant.formats.text ? 1 : 0);
       tree.put("root.clipboardfiles", grant.formats.files ? 1 : 0);
       if (grant.formats.upload_session) {
-        tree.put("root.clipboardbatchversion", 1);
+        tree.put("root.clipboardbatchversion", grant.formats.resumable ? 2 : 1);
       }
     }
   }
@@ -577,7 +577,8 @@ namespace nvhttp {
         get_arg(args, "clipboardtoken", "")
       );
       if (launch_session->clipboard_grant.formats.files) {
-        launch_session->clipboard_grant.formats.upload_session = platf::make_clipboard_upload_session();
+        launch_session->clipboard_grant.formats.resumable = get_arg(args, "clipboardbatchversion", "") == "2";
+        launch_session->clipboard_grant.formats.upload_session = platf::make_clipboard_upload_session(identity.first);
       }
     }
 #endif
@@ -1753,6 +1754,10 @@ namespace nvhttp {
     const auto args = request->parse_query_string();
     const auto op = get_arg(args, "op", "");
     const auto id = get_arg(args, "id", "");
+    if (!grant.resumable && (op == "resume" || op == "discard")) {
+      response->write(status::client_error_bad_request);
+      return;
+    }
     const auto length = request->content.size();
     if (length > (op == "chunk" ? 4U * 1024 * 1024 : 64U * 1024)) {
       response->write(status::client_error_payload_too_large);
@@ -1789,7 +1794,7 @@ namespace nvhttp {
         const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
         auto next = next_log_ms.load(std::memory_order_relaxed);
         if (now >= next && next_log_ms.compare_exchange_strong(next, now + 1000, std::memory_order_relaxed)) {
-          const auto phase = op == "begin" || op == "chunk" || op == "commit" || op == "abort" ? op : "unknown";
+          const auto phase = op == "begin" || op == "resume" || op == "discard" || op == "chunk" || op == "commit" || op == "abort" ? op : "unknown";
           BOOST_LOG(warning) << "Clipboard file batch " << phase << " failed, HTTP " << result.status << ", offset " << offset << ", reason " << (result.conflict.empty() ? "unspecified"sv : result.conflict);
         }
       }
@@ -2034,7 +2039,13 @@ namespace nvhttp {
     std::jthread tcp {accept_and_run, &http_server};
 
     // Wait for any event
+#ifdef _WIN32
+    while (!shutdown_event->view(std::chrono::minutes(1))) {
+      platf::expire_clipboard_uploads();
+    }
+#else
     shutdown_event->view();
+#endif
 
     https_server.stop();
     http_server.stop();

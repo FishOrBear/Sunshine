@@ -27,6 +27,8 @@ namespace clipboard {
 
     std::shared_ptr<platf::clipboard_upload_session_t> upload_session {};  ///< One in-progress clipboard batch, owned by this stream.
 
+    bool resumable {};  ///< Client opted into content-verified reconnect support.
+
     /** @brief Skip contents predating this stream and revisions the client already received. */
     bool should_read(std::uint32_t current, std::optional<std::uint32_t> since) const {
       return since && current != initial_sequence && current != *since;
