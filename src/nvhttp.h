@@ -454,6 +454,8 @@ namespace nvhttp {
      */
     bool authorize_client_certificate(std::string_view cert);
   #ifdef _WIN32
+    /** @brief Check current host opt-in and certificate enablement for power requests. */
+    bool client_may_control_host_power(const std::string &cert);
     /** @brief Exercise the file-only open/close permissions without starting a listener or stream. */
     int change_file_connection(const std::string &cert, const std::string &token, bool close);
     /** @brief Resolve the file data path using its actual grant and pairing checks. */

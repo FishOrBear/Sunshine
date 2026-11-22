@@ -837,6 +837,7 @@ namespace config {
     "sunshine_state.json"s,  // file_state
     {},  // external_ip
     false,  // clipboard_text
+    true,  // host_power
     true,  // file_browser
     false,  // clipboard_files
   };
@@ -1804,6 +1805,7 @@ namespace config {
     bool_f(vars, "clipboard_text", nvhttp.clipboard_text);
     bool_f(vars, "clipboard_files", nvhttp.clipboard_files);
     bool_f(vars, "file_browser", nvhttp.file_browser);
+    bool_f(vars, "host_power", nvhttp.host_power);
     string_f(vars, "sunshine_name", nvhttp.sunshine_name);
     path_f(vars, "log_path", config::sunshine.log_file);
     path_f(vars, "file_state", nvhttp.file_state);

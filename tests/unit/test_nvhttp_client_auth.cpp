@@ -113,6 +113,21 @@ TEST_F(ClientAuthorizationTest, StandaloneFilesRequireEnabledPairingAndCurrentHo
   config::nvhttp.file_browser = original;
 }
 
+TEST_F(ClientAuthorizationTest, PowerRequiresHostOptInAndCurrentExactEnabledCertificate) {
+  const auto creds = test_utils::certificates::generate_ca_credentials();
+  const auto uuid = nvhttp::test_support::add_client("test", creds.x509, true);
+  ASSERT_FALSE(uuid.empty());
+  const auto original = config::nvhttp.host_power;
+  config::nvhttp.host_power = false;
+  EXPECT_FALSE(nvhttp::test_support::client_may_control_host_power(creds.x509));
+  config::nvhttp.host_power = true;
+  EXPECT_TRUE(nvhttp::test_support::client_may_control_host_power(creds.x509));
+  EXPECT_FALSE(nvhttp::test_support::client_may_control_host_power(""));
+  EXPECT_FALSE(nvhttp::test_support::client_may_control_host_power("invalid"));
+  EXPECT_TRUE(nvhttp::set_client_enabled(uuid, false));
+  EXPECT_FALSE(nvhttp::test_support::client_may_control_host_power(creds.x509));
+  config::nvhttp.host_power = original;
+}
 #endif
 
 TEST_F(ClientAuthorizationTest, DerivedLeafDoesNotInheritPairedAuthorization) {

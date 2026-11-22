@@ -221,7 +221,7 @@ TEST_F(ConfigPersistenceTest, ParsesFp16SdrGammaEncodedOption) {
 }
 
 /**
- * @brief File browsing defaults to enabled and obeys its saved override.
+ * @brief File browsing and power requests default to enabled and obey independent overrides.
  */
 TEST_F(ConfigPersistenceTest, FileBrowserEnabledByDefaultAndCanBeDisabled) {
   const auto original_nvhttp = config::nvhttp;
@@ -236,8 +236,13 @@ TEST_F(ConfigPersistenceTest, FileBrowserEnabledByDefaultAndCanBeDisabled) {
   EXPECT_TRUE(config::nvhttp.file_browser);
   EXPECT_FALSE(config::nvhttp.clipboard_files);
   EXPECT_FALSE(config::nvhttp.clipboard_text);
-  config::apply_config_for_test("file_browser = disabled\n");
+  EXPECT_TRUE(config::nvhttp.host_power);
+  config::apply_config_for_test("host_power = disabled\n");
+  EXPECT_FALSE(config::nvhttp.host_power);
+  EXPECT_TRUE(config::nvhttp.file_browser);
+  config::apply_config_for_test("file_browser = disabled\nhost_power = enabled\n");
   EXPECT_FALSE(config::nvhttp.file_browser);
+  EXPECT_TRUE(config::nvhttp.host_power);
   config::apply_config_for_test("file_browser = enabled\n");
   EXPECT_TRUE(config::nvhttp.file_browser);
 }

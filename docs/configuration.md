@@ -740,6 +740,10 @@ On Windows, set `clipboard_files = enabled` and enable clipboard file transfer i
 
 On Windows, paired Moonlight clients can browse local drives and transfer files by default. Choose **File transfer** on the Moonlight device card to open a dedicated file connection, or open the file browser during a stream. Files are accessed with the signed-in user's permissions. To turn this off, clear **Browse and transfer files** in the Input tab of Configuration or set `file_browser = disabled`. Reconnect after changing the setting. Sunshine keeps an interrupted resumable upload for 30 minutes of inactivity while it is running. Reconnect with the same paired client and Windows logon to continue. Both peers verify SHA-256 before publishing the destination file. Existing destination files are preserved.
 
+### host_power
+
+On Windows, enabled paired Moonlight clients can request a shutdown or restart over authenticated HTTPS by default, including when no stream is running. To turn this off, clear **Allow remote shutdown and restart** in the Input tab of Configuration or set `host_power = disabled`. Windows receives a planned power request with a ten-second countdown and can prompt for unsaved work.
+
 ### native_pen_touch
 
 <table>

@@ -139,6 +139,14 @@ watch(
               default="true"
     ></Checkbox>
 
+    <Checkbox v-if="platform === 'windows'"
+              class="mb-3"
+              id="host_power"
+              locale-prefix="config"
+              v-model="config.host_power"
+              default="true"
+    ></Checkbox>
+
     <!-- Enable Gamepad Input -->
     <Checkbox class="mb-3"
               id="controller"

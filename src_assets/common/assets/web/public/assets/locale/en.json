@@ -348,6 +348,8 @@
     "mouse_desc": "Allows guests to control the host system with the mouse",
     "clipboard_text": "Sync clipboard text",
     "clipboard_text_desc": "Allow paired clients to exchange newly copied text during a stream. The client must also enable text sync.",
+    "host_power": "Allow remote shutdown and restart",
+    "host_power_desc": "Paired clients can request a shutdown or restart of this Windows PC even when no stream is running. Clear this setting to disable those requests.",
     "file_browser": "Browse and transfer files",
     "file_browser_desc": "Allow paired clients to browse local drives and copy files accessible to the signed-in Windows user through a file connection or during a stream.",
     "clipboard_files": "Transfer copied files",
