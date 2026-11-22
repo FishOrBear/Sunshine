@@ -734,7 +734,7 @@ On Windows, set `clipboard_text = enabled` to exchange newly copied plain text w
 
 ### clipboard_files
 
-On Windows, set `clipboard_files = enabled` and enable clipboard file transfer in the paired Moonlight client. Copy regular local files in Explorer, then paste them on the other computer. Each transfer supports up to 32 files and a total encoded size of 16 MiB. The default is `disabled`.
+On Windows, set `clipboard_files = enabled` and enable clipboard file transfer in the paired Moonlight client. Copy regular local files in Explorer, then paste them on the other computer. Each transfer supports up to 32 files. Automatic clipboard sync handles up to 16 MiB per copy. With a compatible Windows client, pressing Ctrl+V on the streaming window uploads larger batches from client to host in 4 MiB chunks, up to 16 GiB per paste. The host publishes the files together after the upload completes. The default is `disabled`.
 
 ### native_pen_touch
 

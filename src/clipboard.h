@@ -6,10 +6,15 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
+
+namespace platf {
+  struct clipboard_upload_session_t;
+}
 
 namespace clipboard {
   /**
@@ -19,6 +24,8 @@ namespace clipboard {
     bool text {};  ///< Plain UTF-8 text.
     bool files {};  ///< Regular local files.
     std::uint32_t initial_sequence {};  ///< Clipboard contents already present before this stream started.
+
+    std::shared_ptr<platf::clipboard_upload_session_t> upload_session {};  ///< One in-progress clipboard batch, owned by this stream.
 
     /** @brief Skip contents predating this stream and revisions the client already received. */
     bool should_read(std::uint32_t current, std::optional<std::uint32_t> since) const {
