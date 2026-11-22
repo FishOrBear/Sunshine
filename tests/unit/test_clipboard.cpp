@@ -11,6 +11,7 @@
 #ifdef _WIN32
   // platform includes
   #include "src/platform/windows/clipboard.h"
+  #include "src/platform/windows/clipboard_resume.h"
   #include "src/platform/windows/clipboard_upload.h"
   #include "src/platform/windows/clipboard_win32.h"
 
@@ -143,6 +144,146 @@ GTEST_TEST(ClipboardPublicationDeathTest, DistinguishesBusyClipboardFromChangedR
   ASSERT_EXIT(
     {
       check_clipboard_publication();
+      std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+    },
+    ::testing::ExitedWithCode(0),
+    ""
+  );
+}
+  #endif
+
+namespace {
+  namespace fs = std::filesystem;
+  constexpr std::string_view resume_manifest = R"([{"name":"part","size":3,"sha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"},{"name":"empty","size":0,"sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}])";
+
+  struct resume_test_t {
+    platf::clipboard_upload::resume_cache_t cache;
+    fs::path root = fs::temp_directory_path() / ("sunshine-resume-test-" + std::to_string(GetCurrentProcessId()));
+    std::string cert = "paired-a";
+    LUID logon {7, 3};
+    std::uint64_t stream = 1;
+    bool active = true;
+    std::string lease;
+
+    platf::clipboard_upload_result_t send(std::string_view op, std::string_view bytes = {}, std::uint64_t offset = 0, std::optional<DWORD> since = {}) {
+      const auto id = op == "resume" || op == "discard" ? std::string_view {} : std::string_view(lease);
+      return cache.exchange(root, cert, logon, stream, op, id, 0, offset, since, bytes, [&] {
+        return active;
+      });
+    }
+
+    void resume(std::uint64_t expected) {
+      const auto result = send("resume", resume_manifest);
+      ASSERT_EQ(result.status, 200);
+      const auto response = nlohmann::json::parse(result.id);
+      auto next = response.at("id").get<std::string>();
+      EXPECT_EQ(next.size(), 32U);
+      EXPECT_NE(next, lease);
+      EXPECT_EQ(response.at("offsets"), (nlohmann::json {expected, 0}));
+      lease = std::move(next);
+    }
+  };
+}  // namespace
+
+TEST(ClipboardResumeTest, RebindsOnlyMatchingOwnerAndFileRevisionsAndDiscardsOnCancel) {
+  resume_test_t t;
+  t.resume(0);
+  EXPECT_EQ(t.send("chunk", "ab").status, 204);
+  const auto old = t.lease;
+  t.stream = 2;
+  t.resume(2);
+  const auto current = t.lease;
+  t.lease = old;
+  t.stream = 1;
+  EXPECT_EQ(t.send("abort").status, 404);
+  EXPECT_EQ(t.send("resume", resume_manifest).status, 403);
+  EXPECT_EQ(t.send("discard", resume_manifest).status, 403);
+  t.stream = 3;
+  t.cert = "paired-b";
+  t.resume(0);
+  EXPECT_EQ(t.send("discard", resume_manifest).status, 204);
+  t.cert = "paired-a";
+  ++t.logon.LowPart;
+  t.resume(0);
+  EXPECT_EQ(t.send("abort").status, 204);
+  --t.logon.LowPart;
+  t.resume(2);
+  EXPECT_NE(current, t.lease);
+  EXPECT_EQ(t.send("chunk", "a").conflict, "offset");
+  EXPECT_EQ(t.send("chunk", "c", 2).status, 204);
+  t.active = false;
+  EXPECT_EQ(t.send("discard", resume_manifest).status, 403);
+  t.active = true;
+  EXPECT_EQ(t.send("discard", resume_manifest).status, 204);
+  t.resume(0);
+  EXPECT_EQ(t.send("chunk", "abc").status, 204);
+  auto changed = nlohmann::json::parse(resume_manifest);
+  changed[0]["sha256"] = std::string(64, '0');
+  auto replacement = t.send("resume", changed.dump());
+  ASSERT_EQ(replacement.status, 200);
+  t.lease = nlohmann::json::parse(replacement.id).at("id");
+  EXPECT_EQ(t.send("chunk", "abc").status, 422);
+  EXPECT_EQ(t.send("commit", {}, 0, 0).status, 404);
+  EXPECT_TRUE(fs::is_empty(t.root));
+  fs::remove(t.root);
+}
+
+TEST(ClipboardResumeTest, ExpiresIdleFilesAndEnforcesSharedReservation) {
+  resume_test_t t;
+  t.resume(0);
+  EXPECT_EQ(t.send("chunk", "a").status, 204);
+  auto huge = nlohmann::json::parse(resume_manifest);
+  huge[0]["size"] = platf::clipboard_upload::batch_limit;
+  t.cert = "paired-b";
+  EXPECT_EQ(t.send("resume", huge.dump()).status, 507);
+  t.cache.expire(platf::clipboard_upload::resume_cache_t::clock::now() + std::chrono::minutes(31));
+  EXPECT_TRUE(fs::is_empty(t.root));
+  t.cert = "paired-a";
+  t.resume(0);
+  EXPECT_EQ(t.send("abort").status, 204);
+  EXPECT_TRUE(fs::is_empty(t.root));
+  fs::remove(t.root);
+}
+
+  #ifdef GTEST_HAS_DEATH_TEST
+GTEST_TEST(ClipboardResumeDeathTest, PublishesVerifiedFilesOnceAcrossLostCommitAcknowledgement) {
+  ASSERT_EXIT(
+    {
+      auto station = CreateWindowStationW((L"SunshineResumeTest" + std::to_wstring(GetCurrentProcessId())).c_str(), 0, WINSTA_ALL_ACCESS, nullptr);
+      if (!station || !SetProcessWindowStation(station)) {
+        std::_Exit(2);
+      }
+      auto desk = CreateDesktopW(L"Private", nullptr, nullptr, 0, GENERIC_ALL, nullptr);
+      if (!desk || !SetThreadDesktop(desk)) {
+        std::_Exit(2);
+      }
+      resume_test_t t;
+      const DWORD original = GetClipboardSequenceNumber();
+      t.resume(0);
+      EXPECT_EQ(t.send("chunk", "ab").status, 204);
+      ++t.stream;
+      t.resume(2);
+      EXPECT_EQ(t.send("chunk", "c", 2).status, 204);
+      EXPECT_EQ(t.send("commit").status, 400);
+      EXPECT_EQ(t.send("commit", {}, 0, original + 1).conflict, "sequence");
+      const auto published = t.send("commit", {}, 0, original);
+      EXPECT_EQ(published.status, 204);
+      EXPECT_EQ(published.sequence, GetClipboardSequenceNumber());
+      ++t.stream;
+      t.resume(3);
+      EXPECT_EQ(t.send("commit", {}, 0, original).sequence, published.sequence);
+      EXPECT_EQ(GetClipboardSequenceNumber(), published.sequence);
+      {
+        win_clipboard::detail::clipboard_lock held(nullptr);
+        EXPECT_TRUE(held.opened && IsClipboardFormatAvailable(CF_HDROP));
+      }
+      EXPECT_EQ(t.send("discard", resume_manifest).status, 204);
+      for (const auto &dir : fs::directory_iterator(t.root)) {
+        fs::remove(dir.path() / L"part");
+        fs::remove(dir.path() / L"empty");
+        fs::remove(dir.path());
+      }
+      fs::remove(t.root);
       std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
     },
     ::testing::ExitedWithCode(0),

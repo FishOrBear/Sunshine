@@ -14,12 +14,15 @@
 
 namespace platf {
   /** @brief Allocate the clipboard upload state for one paired stream. */
-  std::shared_ptr<clipboard_upload_session_t> make_clipboard_upload_session();
+  std::shared_ptr<clipboard_upload_session_t> make_clipboard_upload_session(std::string cert);
+
+  /** @brief Release abandoned uploads on the periodic host maintenance tick. */
+  void expire_clipboard_uploads();
 
   /** @brief Result of a bounded clipboard upload operation. */
   struct clipboard_upload_result_t {
     int status;  ///< HTTP status.
-    std::string id {};  ///< Identifier issued by begin.
+    std::string id {};  ///< Identifier issued by begin, or JSON containing the lease and offsets after resume.
     std::optional<std::uint64_t> offset {};  ///< Acknowledged next byte on a chunk.
     std::optional<std::uint32_t> sequence {};  ///< Host revision after publication or a commit conflict.
     std::string_view conflict {};  ///< Fixed, non-sensitive reason returned for HTTP 409.

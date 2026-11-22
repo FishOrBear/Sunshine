@@ -734,7 +734,7 @@ On Windows, set `clipboard_text = enabled` to exchange newly copied plain text w
 
 ### clipboard_files
 
-On Windows, set `clipboard_files = enabled` and enable clipboard file transfer in the paired Moonlight client. Copy regular local files in Explorer, then paste them on the other computer. Each transfer supports up to 32 files. Automatic clipboard sync handles up to 16 MiB per copy. With a compatible Windows client, pressing Ctrl+V on the streaming window uploads larger batches from client to host in 4 MiB chunks, up to 16 GiB per paste. The host publishes the files together after the upload completes. The default is `disabled`.
+On Windows, set `clipboard_files = enabled` and enable clipboard file transfer in the paired Moonlight client. Copy regular local files in Explorer, then paste them on the other computer. Each transfer supports up to 32 files. Automatic clipboard sync handles up to 16 MiB per copy. With a compatible Windows client, pressing Ctrl+V on the streaming window uploads larger batches from client to host in chunks, up to 16 GiB per paste. When both peers support resuming, reconnect and paste the same unchanged files again to continue at the last acknowledged byte in each file. Sunshine retains one unfinished batch per paired client and Windows logon for up to 30 minutes of inactivity. Cancelling discards the partial upload. Sunshine verifies the file hashes and publishes the batch together after the upload completes. The default is `disabled`.
 
 ### native_pen_touch
 
