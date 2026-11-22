@@ -26,7 +26,33 @@ const globalOptions = {
   },
 }
 
+describe('clipboard settings', () => {
+  it.each(['windows', 'linux', 'macos'])('exposes text and file permissions on Windows (%s)', platform => {
+    const wrapper = mount(Inputs, {
+      props: { platform, config: { clipboard_text: 'disabled', clipboard_files: 'disabled' } },
+      global: globalOptions,
+    })
+    for (const option of ['clipboard_text', 'clipboard_files']) {
+      expect(wrapper.find(`#${option}`).exists()).toBe(platform === 'windows')
+    }
+  })
+})
+
 describe('configuration accessibility', () => {
+  it('explains the virtual display prerequisite and mandatory restoration in privacy mode', () => {
+    const wrapper = mount(DisplayDeviceOptions, {
+      props: {
+        platform: 'windows',
+        config: { dd_configuration_option: 'privacy_screen' },
+      },
+      global: globalOptions,
+    })
+    expect(wrapper.get('#dd_configuration_option').element.value).toBe('privacy_screen')
+    expect(wrapper.text()).toContain('config.dd_config_privacy_screen_desc')
+    expect(wrapper.find('#dd_config_revert_on_disconnect').exists()).toBe(false)
+    expect(wrapper.get('#lock_on_disconnect')).toBeDefined()
+  })
+
   it('gives every global prep command input an accessible label', () => {
     const wrapper = mount(General, {
       props: {

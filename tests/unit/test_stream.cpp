@@ -21,6 +21,7 @@
 
 // local includes
 #include <src/network.h>
+#include <src/stream.h>
 
 namespace stream {
   std::vector<uint8_t> concat_and_insert(uint64_t insert_size, uint64_t slice_size, const std::string_view &data1, const std::string_view &data2);
@@ -37,6 +38,17 @@ namespace stream {
     int max_data_shards(int percentage);
   }  // namespace fec
 }  // namespace stream
+
+/** @brief A lock request survives its client and expires when the final overlapping stream finishes. */
+TEST(StreamActivityTests, LocksOnlyAfterTheLastOverlappingClient) {
+  stream::session::activity_t sessions;
+  EXPECT_TRUE(sessions.start(true));
+  EXPECT_FALSE(sessions.start(false));
+  EXPECT_EQ(sessions.finish(), std::nullopt);
+  EXPECT_EQ(sessions.finish(), std::optional {true});
+  EXPECT_TRUE(sessions.start(false));
+  EXPECT_EQ(sessions.finish(), std::optional {false});
+}
 
 /**
  * @brief Preserve the 8-bit shard limits for disabled, default, and maximum FEC.

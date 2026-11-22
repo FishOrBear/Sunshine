@@ -8,6 +8,7 @@
 // standard includes
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <chrono>
 #include <filesystem>
 #include <format>
@@ -16,6 +17,7 @@
 #include <utility>
 
 // lib includes
+#include <boost/algorithm/string/predicate.hpp>
 #include <boost/asio/ssl/context.hpp>
 #include <boost/asio/ssl/context_base.hpp>
 #include <boost/property_tree/json_parser.hpp>
@@ -33,6 +35,9 @@
 #include "network.h"
 #include "nvhttp.h"
 #include "platform/common.h"
+#ifdef _WIN32
+  #include "platform/windows/clipboard.h"
+#endif
 #include "process.h"
 #include "rtsp.h"
 #include "string_hash.h"
@@ -82,7 +87,25 @@ namespace nvhttp {
       context.use_private_key_file(private_key_file, boost::asio::ssl::context::pem);
     }
 
-    std::function<int(SSL *)> verify;  ///< Callback that validates a client's TLS certificate after handshake.
+    /** @brief Resolve the peer of a request on its own verified TLS socket, including keep-alive requests. */
+    std::pair<std::string, std::string> client_identity(const Request &request) {
+      const auto remote = request.remote_endpoint();
+      const auto local = request.local_endpoint();
+      SimpleWeb::LockGuard lock(connections->mutex);
+      for (const auto *connection : connections->set) {
+        const auto &socket = connection->socket;
+        if (socket->client_cert.empty()) {
+          continue;
+        }
+        SimpleWeb::error_code ec;
+        if (socket->lowest_layer().remote_endpoint(ec) == remote && !ec && socket->lowest_layer().local_endpoint(ec) == local && !ec) {
+          return {socket->client_cert, socket->client_name};
+        }
+      }
+      return {};
+    }
+
+    std::function<int(SunshineHTTPS &)> verify;  ///< Callback that validates a client's TLS certificate after handshake.
     std::function<void(std::shared_ptr<Response>, std::shared_ptr<Request>)> on_verify_failed;  ///< Handler used to return the pairing challenge when client verification fails.
 
   protected:
@@ -111,7 +134,7 @@ namespace nvhttp {
      */
     void handle_handshake(const std::shared_ptr<Session> &session, const SimpleWeb::error_code &ec) {
       if (!ec) {
-        if (verify && !verify(session->connection->socket->native_handle())) {
+        if (verify && !verify(*session->connection->socket)) {
           this->write(session, on_verify_failed);
         } else {
           this->read(session);
@@ -208,10 +231,6 @@ namespace nvhttp {
 
   client_t client_root;  ///< In-memory representation of the paired-client database.
   std::atomic<uint32_t> session_id_counter;  ///< Monotonic counter used to allocate GameStream session IDs.
-
-  // Set by TLS verify callback, read by launch/resume handler (single-threaded HTTPS server)
-  std::string last_verified_client_cert;  ///< Last client certificate accepted by the TLS verify callback.  // NOSONAR(cpp:S5421): intentionally mutable global
-  std::string last_verified_client_name;  ///< Friendly name of last client certificate accepted by the TLS verify callback. // NOSONAR(cpp:S5421): intentionally mutable global
 
   /**
    * @brief Case-insensitive map used for HTTP headers and query parameters.
@@ -477,6 +496,15 @@ namespace nvhttp {
     return uuid;
   }
 
+  /** @brief Acknowledge only the clipboard formats enabled on both peers. */
+  void advertise_clipboard(pt::ptree &tree, const clipboard::grant_t &grant) {
+    if (!grant.token.empty()) {
+      tree.put("root.clipboardversion", 1);
+      tree.put("root.clipboardtext", grant.formats.text ? 1 : 0);
+      tree.put("root.clipboardfiles", grant.formats.files ? 1 : 0);
+    }
+  }
+
   /**
    * @brief Create launch session.
    *
@@ -484,7 +512,7 @@ namespace nvhttp {
    * @param args Arguments forwarded to the callable or parser.
    * @return Constructed launch session object.
    */
-  std::shared_ptr<rtsp_stream::launch_session_t> make_launch_session(bool host_audio, const args_t &args) {
+  std::shared_ptr<rtsp_stream::launch_session_t> make_launch_session(bool host_audio, const args_t &args, const std::pair<std::string, std::string> &identity) {
     auto launch_session = std::make_shared<rtsp_stream::launch_session_t>();
 
     launch_session->id = ++session_id_counter;
@@ -493,6 +521,9 @@ namespace nvhttp {
     std::copy(rikey.cbegin(), rikey.cend(), std::back_inserter(launch_session->gcm_key));
 
     launch_session->host_audio = host_audio;
+#ifdef _WIN32
+    launch_session->lock_on_disconnect = config::video.dd.lock_on_disconnect || get_arg(args, "lockOnDisconnect", "0") == "1";
+#endif
     auto mode = std::stringstream(get_arg(args, "mode", "0x0x0"));
     // Split mode by the char "x", to populate width/height/fps
     int x = 0;
@@ -532,8 +563,17 @@ namespace nvhttp {
       launch_session->rtsp_iv_counter = 0;
     }
     launch_session->rtsp_url_scheme = launch_session->rtsp_cipher ? "rtspenc://"s : "rtsp://"s;
-    launch_session->client_cert = last_verified_client_cert;
-    launch_session->client_name = last_verified_client_name;
+    launch_session->client_cert = identity.first;
+    launch_session->client_name = identity.second;
+#ifdef _WIN32
+    if (!identity.first.empty()) {
+      launch_session->clipboard_grant = clipboard::negotiate(
+        {config::nvhttp.clipboard_text, config::nvhttp.clipboard_files},
+        {get_arg(args, "clipboardtext", "0") == "1", get_arg(args, "clipboardfiles", "0") == "1"},
+        get_arg(args, "clipboardtoken", "")
+      );
+    }
+#endif
 
     // Generate the unique identifiers for this connection that we will send later during RTSP handshake
     std::array<unsigned char, 8> raw_payload;
@@ -949,13 +989,17 @@ namespace nvhttp {
     BOOST_LOG(debug) << "DESTINATION :: "sv << request->path;
 
     for (auto &[name, val] : request->header) {
-      BOOST_LOG(debug) << name << " -- " << val;
+      if (!boost::iequals(name, "clipboardtoken") && !boost::iequals(name, "X-Clipboard-Token")) {
+        BOOST_LOG(debug) << name << " -- " << val;
+      }
     }
 
     BOOST_LOG(debug) << " [--] "sv;
 
     for (auto &[name, val] : request->parse_query_string()) {
-      BOOST_LOG(debug) << name << " -- " << val;
+      if (!boost::iequals(name, "clipboardtoken") && !boost::iequals(name, "X-Clipboard-Token")) {
+        BOOST_LOG(debug) << name << " -- " << val;
+      }
     }
 
     BOOST_LOG(debug) << " [--] "sv;
@@ -1369,7 +1413,7 @@ namespace nvhttp {
    * @param response HTTP response object to populate.
    * @param request HTTP request data from the client.
    */
-  void launch(bool &host_audio, resp_https_t response, req_https_t request) {
+  void launch(bool &host_audio, resp_https_t response, req_https_t request, const std::pair<std::string, std::string> &identity) {
     print_req<SunshineHTTPS>(request);
 
     pt::ptree tree;
@@ -1415,8 +1459,14 @@ namespace nvhttp {
       return;
     }
 
+    if (rtsp_stream::launch_session_pending()) {
+      tree.put("root.gamesession", 0);
+      tree.put("root.<xmlattr>.status_code", 503);
+      tree.put("root.<xmlattr>.status_message", "Another streaming handshake is in progress");
+      return;
+    }
     host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
-    auto launch_session = make_launch_session(host_audio, args);
+    auto launch_session = make_launch_session(host_audio, args, identity);
 
     if (rtsp_stream::session_count() == 0) {
       // The display should be restored in case something fails as there are no other sessions.
@@ -1425,7 +1475,12 @@ namespace nvhttp {
       // We want to prepare display only if there are no active sessions at
       // the moment. This should be done before probing encoders as it could
       // change the active displays.
-      display_device::configure_display(config::video, *launch_session);
+      if (!display_device::configure_display(config::video, *launch_session)) {
+        tree.put("root.gamesession", 0);
+        tree.put("root.<xmlattr>.status_code", 503);
+        tree.put("root.<xmlattr>.status_message", "Privacy screen unavailable. Select a Windows indirect virtual display as the output.");
+        return;
+      }
 
       // Probe encoders again before streaming to ensure our chosen
       // encoder matches the active GPU (which could have changed
@@ -1473,7 +1528,11 @@ namespace nvhttp {
       )
     );
     tree.put("root.gamesession", 1);
+    if (launch_session->lock_on_disconnect) {
+      tree.put("root.lockOnDisconnect", 1);
+    }
 
+    advertise_clipboard(tree, launch_session->clipboard_grant);
     rtsp_stream::launch_session_raise(launch_session);
 
     // Stream was started successfully, we will revert the config when the app or session terminates
@@ -1487,7 +1546,7 @@ namespace nvhttp {
    * @param response HTTP response object to populate.
    * @param request HTTP request data from the client.
    */
-  void resume(bool &host_audio, resp_https_t response, req_https_t request) {
+  void resume(bool &host_audio, resp_https_t response, req_https_t request, const std::pair<std::string, std::string> &identity) {
     print_req<SunshineHTTPS>(request);
 
     pt::ptree tree;
@@ -1524,6 +1583,13 @@ namespace nvhttp {
       return;
     }
 
+    if (rtsp_stream::launch_session_pending()) {
+      tree.put("root.resume", 0);
+      tree.put("root.<xmlattr>.status_code", 503);
+      tree.put("root.<xmlattr>.status_message", "Another streaming handshake is in progress");
+      return;
+    }
+
     // Newer Moonlight clients send localAudioPlayMode on /resume too,
     // so we should use it if it's present in the args and there are
     // no active sessions we could be interfering with.
@@ -1531,13 +1597,25 @@ namespace nvhttp {
     if (no_active_sessions && args.find("localAudioPlayMode"s) != std::end(args)) {
       host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
     }
-    const auto launch_session = make_launch_session(host_audio, args);
+    const auto launch_session = make_launch_session(host_audio, args, identity);
+
+    // An unsuccessful resume can leave a background application alive without a stream.
+    auto privacy_guard = util::fail_guard([&]() {
+      if (no_active_sessions && config::video.dd.configuration_option == config::video_t::dd_t::config_option_e::privacy_screen) {
+        display_device::revert_configuration();
+      }
+    });
 
     if (no_active_sessions) {
       // We want to prepare display only if there are no active sessions at
       // the moment. This should be done before probing encoders as it could
       // change the active displays.
-      display_device::configure_display(config::video, *launch_session);
+      if (!display_device::configure_display(config::video, *launch_session)) {
+        tree.put("root.resume", 0);
+        tree.put("root.<xmlattr>.status_code", 503);
+        tree.put("root.<xmlattr>.status_message", "Privacy screen unavailable. Select a Windows indirect virtual display as the output.");
+        return;
+      }
 
       // Probe encoders again before streaming to ensure our chosen
       // encoder matches the active GPU (which could have changed
@@ -1575,7 +1653,13 @@ namespace nvhttp {
     );
     tree.put("root.resume", 1);
 
+    if (launch_session->lock_on_disconnect) {
+      tree.put("root.lockOnDisconnect", 1);
+    }
+
+    advertise_clipboard(tree, launch_session->clipboard_grant);
     rtsp_stream::launch_session_raise(launch_session);
+    privacy_guard.disable();
   }
 
   /**
@@ -1628,6 +1712,79 @@ namespace nvhttp {
     response->close_connection_after_response = true;
   }
 
+#ifdef _WIN32
+  /** @brief Exchange clipboard contents over the authenticated connection of a running stream. */
+  void handle_clipboard(resp_https_t response, req_https_t request, const std::string &cert) {
+    using status = SimpleWeb::StatusCode;
+    const auto token = request->header.find("X-Clipboard-Token");
+    const auto formats = token == request->header.end() ? clipboard::formats_t {} : rtsp_stream::clipboard_formats(cert, token->second);
+    if (!formats.matches_any()) {
+      response->write(status::client_error_forbidden);
+      return;
+    }
+    {
+      std::lock_guard lock {client_auth_mutex()};
+      if (!is_client_enabled(crypto::x509(cert).get())) {
+        response->write(status::client_error_forbidden);
+        return;
+      }
+    }
+
+    const bool upload = request->method == "POST";
+    const auto args = request->parse_query_string();
+    const auto sequence_arg = get_arg(args, "since", upload ? "" : "init");
+    std::optional<std::uint32_t> since;
+    if (!(upload ? sequence_arg.empty() : sequence_arg == "init")) {
+      std::uint32_t value {};
+      const auto end = sequence_arg.data() + sequence_arg.size();
+      const auto parsed = std::from_chars(sequence_arg.data(), end, value);
+      if (parsed.ec != std::errc {} || parsed.ptr != end) {
+        response->write(status::client_error_bad_request);
+        return;
+      }
+      since = value;
+    }
+
+    constexpr std::size_t max_body = 16 * 1024 * 1024;
+    if (request->content.size() > max_body) {
+      response->write(status::client_error_payload_too_large);
+      return;
+    }
+    if (!upload && request->content.size() != 0) {
+      response->write(status::client_error_bad_request);
+      return;
+    }
+    auto allowed = formats;
+    if (!upload) {
+      allowed.text &= get_arg(args, "text", "0") == "1";
+      allowed.files &= get_arg(args, "files", "0") == "1";
+    }
+
+    std::string payload;
+    std::uint32_t sequence {};
+    try {
+      const auto input = upload ? request->content.string() : std::string {};
+      const auto grant_active = [&]() {
+        return rtsp_stream::clipboard_formats(cert, token->second).matches_any();
+      };
+      auto result = platf::exchange_clipboard(allowed, upload, since, input, payload, sequence, grant_active);
+      if (result == 200 && !grant_active()) {
+        response->write(status::client_error_forbidden);
+        return;
+      }
+      SimpleWeb::CaseInsensitiveMultimap headers {{"Cache-Control", "no-store"}, {"X-Clipboard-Sequence", std::to_string(sequence)}};
+      if (result == 200) {
+        headers.emplace("Content-Type", "application/octet-stream");
+        response->write(status::success_ok, payload, headers);
+      } else {
+        response->write(static_cast<status>(result), headers);
+      }
+    } catch (const std::exception &) {
+      response->write(status::server_error_internal_server_error);
+    }
+  }
+#endif
+
   void setup(const std::string &pkey, const std::string &cert) {
     conf_intern.pkey = pkey;
     conf_intern.servercert = cert;
@@ -1668,7 +1825,8 @@ namespace nvhttp {
     http_server_t http_server;
 
     // Verify certificates after establishing connection
-    https_server.verify = [](SSL *ssl) {
+    https_server.verify = [](SunshineHTTPS &socket) {
+      auto *ssl = socket.native_handle();
       crypto::x509_t x509 {
 #if OPENSSL_VERSION_MAJOR >= 3
         SSL_get1_peer_certificate(ssl)
@@ -1707,8 +1865,8 @@ namespace nvhttp {
         return verified;
       }
 
-      last_verified_client_cert = pem;
-      last_verified_client_name = client_name;
+      socket.client_cert = std::move(pem);
+      socket.client_name = std::move(client_name);
       verified = 1;
 
       return verified;
@@ -1736,14 +1894,23 @@ namespace nvhttp {
     };
     https_server.resource["^/applist$"]["GET"] = applist;
     https_server.resource["^/appasset$"]["GET"] = appasset;
-    https_server.resource["^/launch$"]["GET"] = [&host_audio](auto resp, auto req) {
-      launch(host_audio, resp, req);
+    https_server.resource["^/launch$"]["GET"] = [&](auto resp, auto req) {
+      launch(host_audio, resp, req, https_server.client_identity(*req));
     };
-    https_server.resource["^/resume$"]["GET"] = [&host_audio](auto resp, auto req) {
-      resume(host_audio, resp, req);
+    https_server.resource["^/resume$"]["GET"] = [&](auto resp, auto req) {
+      resume(host_audio, resp, req, https_server.client_identity(*req));
     };
     https_server.resource["^/cancel$"]["GET"] = cancel;
 
+#ifdef _WIN32
+    // Bound the TLS server's buffering before the request reaches a clipboard handler.
+    https_server.config.max_request_streambuf_size = 16 * 1024 * 1024;
+    for (const auto *method : {"GET", "POST"}) {
+      https_server.resource["^/clipboard$"][method] = [&](auto resp, auto req) {
+        handle_clipboard(resp, req, https_server.client_identity(*req).first);
+      };
+    }
+#endif
     https_server.config.reuse_address = true;
     https_server.config.address = net::get_bind_address(address_family);
     https_server.config.port = port_https;

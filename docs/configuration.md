@@ -728,6 +728,14 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
     </tr>
 </table>
 
+### clipboard_text
+
+On Windows, set `clipboard_text = enabled` to exchange newly copied plain text with a paired Moonlight client during a stream. Enable text sync in the client as well. The default is `disabled`. Each text item can contain up to 1 MiB of UTF-8 text.
+
+### clipboard_files
+
+On Windows, set `clipboard_files = enabled` and enable clipboard file transfer in the paired Moonlight client. Copy regular local files in Explorer, then paste them on the other computer. Each transfer supports up to 32 files and a total encoded size of 16 MiB. The default is `disabled`.
+
 ### native_pen_touch
 
 <table>
@@ -1187,7 +1195,22 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
         <td>ensure_only_display</td>
         <td>Activate the display if it's currently inactive and disable all others.</td>
     </tr>
+    <tr>
+        <td>privacy_screen</td>
+        <td>Windows only. Install an indirect virtual display and set <code>output_name</code> to its device ID from the Sunshine log.
+            Sunshine disables the physical outputs and checks that the virtual display is the only active output before streaming.
+            If Windows reports the selected target as a physical display, Sunshine rejects the stream.
+            Sunshine checks the topology during streaming and ends the session if a physical output becomes active.
+            The previous layout is restored when the last client leaves, including after a network timeout.</td>
+    </tr>
 </table>
+
+### lock_on_disconnect
+
+Set `lock_on_disconnect = enabled` to request a Windows workstation lock when the final client disconnects.
+Sunshine sends the lock request before restoring the physical display layout. This also applies when the client or network stops responding.
+The default is `disabled`. A paired client may request locking for an individual session. When sessions overlap,
+Sunshine remembers the request until all clients have disconnected.
 
 ### dd_resolution_option
 

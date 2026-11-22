@@ -597,6 +597,7 @@ namespace config {
       _CONVERT_(ensure_active);
       _CONVERT_(ensure_primary);
       _CONVERT_(ensure_only_display);
+      _CONVERT_(privacy_screen);
 #ifndef DOXYGEN
   #undef _CONVERT_
 #endif
@@ -787,6 +788,7 @@ namespace config {
       video_t::dd_t::hdr_option_e::automatic,  // hdr_option
       3s,  // config_revert_delay
       {},  // config_revert_on_disconnect
+      {},  // lock_on_disconnect
       {},  // mode_remapping
       {}  // wa
     },  // display_device
@@ -1783,6 +1785,7 @@ namespace config {
       }
     }
     bool_f(vars, "dd_config_revert_on_disconnect", video.dd.config_revert_on_disconnect);
+    bool_f(vars, "lock_on_disconnect", video.dd.lock_on_disconnect);
     generic_f(vars, "dd_mode_remapping", video.dd.mode_remapping, dd::mode_remapping_from_view);
     {
       int value = 0;
@@ -1795,6 +1798,8 @@ namespace config {
 
     path_f(vars, "pkey", nvhttp.pkey);
     path_f(vars, "cert", nvhttp.cert);
+    bool_f(vars, "clipboard_text", nvhttp.clipboard_text);
+    bool_f(vars, "clipboard_files", nvhttp.clipboard_files);
     string_f(vars, "sunshine_name", nvhttp.sunshine_name);
     path_f(vars, "log_path", config::sunshine.log_file);
     path_f(vars, "file_state", nvhttp.file_state);

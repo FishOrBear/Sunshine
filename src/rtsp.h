@@ -11,6 +11,7 @@
 #include <cstdint>
 
 // local includes
+#include "clipboard.h"
 #include "crypto.h"
 #include "thread_safe.h"
 
@@ -78,10 +79,12 @@ namespace rtsp_stream {
     crypto::aes_t gcm_key;  ///< AES-GCM key negotiated for encrypted RTSP messages.
     crypto::aes_t iv;  ///< Initial RTSP AES-GCM IV supplied by the client.
 
+    clipboard::grant_t clipboard_grant;  ///< Session-scoped clipboard access negotiated over TLS.
     std::string av_ping_payload;  ///< AV ping payload.
     uint32_t control_connect_data;  ///< Client-provided token used when connecting the control channel.
 
     bool host_audio;  ///< Whether host audio should be played locally.
+    bool lock_on_disconnect {};  ///< Request to lock Windows when the last overlapping session disconnects.
     std::string unique_id;  ///< Moonlight client unique identifier for this launch request.
     int width;  ///< Frame or display width in pixels.
     int height;  ///< Frame or display height in pixels.
@@ -109,6 +112,12 @@ namespace rtsp_stream {
   void launch_session_raise(std::shared_ptr<launch_session_t> launch_session);
 
   /**
+   * @brief Check whether an earlier launch or resume is still negotiating RTSP.
+   * @return True when a new HTTPS launch request must wait for the current handshake.
+   */
+  [[nodiscard]] bool launch_session_pending();
+
+  /**
    * @brief Clear state for the specified launch session.
    * @param launch_session_id The ID of the session to clear.
    */
@@ -119,6 +128,9 @@ namespace rtsp_stream {
    * @return Count of active sessions.
    */
   int session_count();
+
+  /** @brief Retrieve allowed formats for the authenticated owner of a running stream. */
+  clipboard::formats_t clipboard_formats(std::string_view cert, std::string_view token);
 
   /**
    * @brief Terminates all running streaming sessions.

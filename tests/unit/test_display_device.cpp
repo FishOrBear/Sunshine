@@ -23,6 +23,15 @@
 #include <src/display_device.h>
 #include <src/rtsp.h>
 
+#ifdef _WIN32
+  // platform-specific includes
+  #include <display_device/windows/win_api_layer.h>
+
+namespace display_device {
+  bool has_privacy_target(const WinApiLayerInterface &api, QueryType type, const std::string &device_id);
+}
+#endif
+
 namespace {
   using config_option_e = config::video_t::dd_t::config_option_e;
   using device_prep_t = display_device::SingleDisplayConfiguration::DevicePreparation;
@@ -81,6 +90,52 @@ TEST_P(ParseDeviceId, IntegrationTest) {
   const auto result {display_device::parse_configuration(video_config, {})};
   EXPECT_EQ(std::get<display_device::SingleDisplayConfiguration>(result).m_device_id, expected_value);
 }
+
+/** @brief A privacy stream must target an explicit virtual display and must never default to the primary monitor. */
+TEST(PrivateDisplayTests, RequiresAnExplicitOutput) {
+  config::video_t video_config {};
+  video_config.dd.configuration_option = config_option_e::privacy_screen;
+  EXPECT_FALSE(display_device::configure_display(video_config, {}));
+  video_config.output_name = "{virtual-device-id}";
+  const auto result = display_device::parse_configuration(video_config, {});
+  const auto *config = std::get_if<display_device::SingleDisplayConfiguration>(&result);
+  ASSERT_NE(config, nullptr);
+  EXPECT_EQ(config->m_device_id, video_config.output_name);
+  EXPECT_EQ(config->m_device_prep, device_prep_t::EnsureOnlyDisplay);
+}
+
+#ifdef _WIN32
+/** @brief Require a monitored virtual target before launch and reject physical, cloned, or missing targets. */
+TEST(PrivateDisplayTests, VerifiesTheExclusiveVirtualTarget) {
+  using namespace display_device;
+
+  class topology_t: public WinApiLayer {
+  public:
+    std::optional<PathAndModeData> data;  ///< Simulated query result.
+
+    std::optional<PathAndModeData> queryDisplayConfig(QueryType) const override {
+      return data;
+    }
+
+    std::string getDeviceId(const DISPLAYCONFIG_PATH_INFO &) const override {
+      return "virtual-monitor";
+    }
+  } api;
+
+  EXPECT_FALSE(has_privacy_target(api, QueryType::Active, {}));
+  api.data.emplace();
+  EXPECT_FALSE(has_privacy_target(api, QueryType::Active, {}));
+  auto &path = api.data->m_paths.emplace_back();
+  path.targetInfo.outputTechnology = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI;
+  EXPECT_FALSE(has_privacy_target(api, QueryType::Active, {}));
+  path.targetInfo.outputTechnology = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_VIRTUAL;
+  EXPECT_TRUE(has_privacy_target(api, QueryType::Active, "virtual-monitor"));
+  EXPECT_FALSE(has_privacy_target(api, QueryType::All, "unknown-monitor"));
+  api.data->m_paths.emplace_back().targetInfo.outputTechnology = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI;
+  EXPECT_TRUE(has_privacy_target(api, QueryType::All, "virtual-monitor"));
+  EXPECT_FALSE(has_privacy_target(api, QueryType::Active, {}));
+}
+#endif
 
 using ParseConfigOption = DisplayDeviceConfigTest<std::pair<config_option_e, std::optional<device_prep_t>>>;
 INSTANTIATE_TEST_SUITE_P(

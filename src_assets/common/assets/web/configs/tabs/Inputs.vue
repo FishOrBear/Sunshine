@@ -115,6 +115,22 @@ watch(
 
 <template>
   <div id="input" class="config-page">
+    <Checkbox v-if="platform === 'windows'"
+              class="mb-3"
+              id="clipboard_text"
+              locale-prefix="config"
+              v-model="config.clipboard_text"
+              default="false"
+    ></Checkbox>
+
+    <Checkbox v-if="platform === 'windows'"
+              class="mb-3"
+              id="clipboard_files"
+              locale-prefix="config"
+              v-model="config.clipboard_files"
+              default="false"
+    ></Checkbox>
+
     <!-- Enable Gamepad Input -->
     <Checkbox class="mb-3"
               id="controller"

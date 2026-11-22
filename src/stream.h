@@ -5,6 +5,7 @@
 #pragma once
 
 // standard includes
+#include <optional>
 #include <utility>
 
 // lib includes
@@ -12,8 +13,13 @@
 
 // local includes
 #include "audio.h"
+#include "clipboard.h"
 #include "crypto.h"
 #include "video.h"
+
+namespace rtsp_stream {
+  struct launch_session_t;
+}
 
 namespace stream {
   constexpr auto VIDEO_STREAM_PORT = 9;  ///< GameStream base-port offset used for the video UDP stream.
@@ -42,6 +48,37 @@ namespace stream {
   };
 
   namespace session {
+    /**
+     * @brief Track overlapping streams and defer desktop locking until the host is idle.
+     */
+    class activity_t {
+    public:
+      /**
+       * @brief Register a newly started stream.
+       * @param lock_on_disconnect Whether the stream requests a workstation lock.
+       * @return True when this is the first active stream.
+       */
+      [[nodiscard]] bool start(bool lock_on_disconnect) {
+        pending_lock |= lock_on_disconnect;
+        return ++active == 1;
+      }
+
+      /**
+       * @brief Unregister a stream that has finished teardown.
+       * @return Empty while other streams remain, otherwise whether a lock was requested.
+       */
+      [[nodiscard]] std::optional<bool> finish() {
+        if (--active != 0) {
+          return std::nullopt;
+        }
+        return std::exchange(pending_lock, false);
+      }
+
+    private:
+      unsigned int active {};  ///< Number of started streams awaiting teardown.
+      bool pending_lock {};  ///< Whether any overlapping stream requested a lock.
+    };
+
     /**
      * @brief Enumerates supported state options.
      */
@@ -94,5 +131,8 @@ namespace stream {
      * @return PEM certificate associated with the session's client.
      */
     const std::string &client_cert(session_t &session);
+
+    /** @brief Get the immutable clipboard capability associated with a session. */
+    const clipboard::grant_t &clipboard_grant(const session_t &session);
   }  // namespace session
 }  // namespace stream

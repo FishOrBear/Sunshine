@@ -394,6 +394,7 @@ namespace display_device {
         case ensure_primary:
           return EnsurePrimary;
         case ensure_only_display:
+        case privacy_screen:
           return EnsureOnlyDisplay;
         case disabled:
           break;
@@ -949,22 +950,68 @@ namespace display_device {
     return mapped_name;
   }
 
-  void configure_display(const config::video_t &video_config, const rtsp_stream::launch_session_t &session) {
+#ifdef _WIN32
+  /**
+   * @brief Verify that a virtual target is available or exclusively active.
+   * @param api Windows display configuration access.
+   * @param type Active to require one active target, All to find even a disabled target.
+   * @param device_id Selected target ID, or empty to accept any indirect virtual target.
+   * @return True when the requested topology contains a matching target.
+   */
+  bool has_privacy_target(const WinApiLayerInterface &api, QueryType type, const std::string &device_id) {
+    const auto data = api.queryDisplayConfig(type);
+    // Count target paths so a cloned physical monitor cannot pass the exclusive check.
+    if (!data || (type == QueryType::Active && data->m_paths.size() != 1)) {
+      return false;
+    }
+    return std::ranges::any_of(data->m_paths, [&](const auto &path) {
+      return path.targetInfo.outputTechnology == DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_VIRTUAL && (device_id.empty() || api.getDeviceId(path) == device_id);
+    });
+  }
+#endif
+
+  bool privacy_screen_active() {
+#ifdef _WIN32
+    return has_privacy_target(WinApiLayer {}, QueryType::Active, {});
+#else
+    return false;
+#endif
+  }
+
+  bool configure_display(const config::video_t &video_config, const rtsp_stream::launch_session_t &session) {
+    const bool privacy = video_config.dd.configuration_option == config::video_t::dd_t::config_option_e::privacy_screen;
     const auto result {parse_configuration(video_config, session)};
     if (const auto *parsed_config {std::get_if<SingleDisplayConfiguration>(&result)}; parsed_config) {
+      if (privacy) {
+#ifdef _WIN32
+        std::lock_guard lock {DD_DATA.mutex};
+        const WinApiLayer api;
+        if (!has_privacy_target(api, QueryType::All, parsed_config->m_device_id)) {
+          return false;
+        }
+        return DD_DATA.sm_instance && DD_DATA.sm_instance->execute([&](auto &settings_iface, auto &stop_token) {
+          // Cancel any previous restore and apply synchronously before an app or stream can start.
+          stop_token.requestStop();
+          return settings_iface.applySettings(*parsed_config) == SettingsManagerInterface::ApplyResult::Ok && has_privacy_target(api, QueryType::Active, parsed_config->m_device_id);
+        });
+#else
+        return false;
+#endif
+      }
       configure_display(*parsed_config);
-      return;
+      return true;
     }
 
     if (const auto *disabled {std::get_if<configuration_disabled_tag_t>(&result)}; disabled) {
       BOOST_LOG(info) << "Display device configuration is disabled. Reverting any active display device configuration.";
       revert_configuration();
-      return;
+      return true;
     }
 
     BOOST_LOG(error) << "Failed to parse display device configuration. Display settings will not be changed.";
     // Error details should already be logged for failed_to_parse_tag_t case, and we also don't
     // want to revert active configuration in case we have any
+    return !privacy;
   }
 
   void configure_display(const SingleDisplayConfiguration &config) {
@@ -1031,6 +1078,10 @@ namespace display_device {
   }
 
   std::variant<failed_to_parse_tag_t, configuration_disabled_tag_t, SingleDisplayConfiguration> parse_configuration(const config::video_t &video_config, const rtsp_stream::launch_session_t &session) {
+    if (video_config.dd.configuration_option == config::video_t::dd_t::config_option_e::privacy_screen && video_config.output_name.empty()) {
+      BOOST_LOG(error) << "Privacy screen requires the device ID of an installed virtual display in output_name.";
+      return failed_to_parse_tag_t {};
+    }
     const auto device_prep {parse_device_prep_option(video_config)};
     if (!device_prep) {
       return configuration_disabled_tag_t {};
