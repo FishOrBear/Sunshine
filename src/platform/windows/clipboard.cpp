@@ -86,8 +86,11 @@ namespace platf {
 
   clipboard_upload_result_t exchange_clipboard_batch(clipboard_upload_session_t &session, std::string_view op, std::string_view id, std::uint32_t file, std::uint64_t offset, std::optional<std::uint32_t> since, std::string_view input, const std::function<bool()> &grant_active) {
     shell_impersonation_t user;
-    if (!user.begin() || !on_user_desktop()) {
-      return {409};
+    if (!user.begin()) {
+      return {409, {}, {}, {}, "shell"};
+    }
+    if (!on_user_desktop()) {
+      return {409, {}, {}, {}, "desktop"};
     }
     TOKEN_STATISTICS stats {};
     DWORD needed {};
@@ -123,7 +126,10 @@ namespace platf {
     }
     if (op == "commit" && !id.empty() && id == session.last_id && input.empty()) {
       auto revision = GetClipboardSequenceNumber();
-      return {revision == session.last_revision ? 204 : 409, {}, {}, revision};
+      if (revision != session.last_revision) {
+        return {409, {}, {}, revision, "sequence"};
+      }
+      return {204, {}, {}, revision};
     }
     if (!session.pending || session.pending->id != id) {
       return {404};
@@ -136,6 +142,9 @@ namespace platf {
     if (op == "chunk") {
       int status = batch.append(file, offset, input);
       if (status != 204) {
+        if (status == 409) {
+          return {409, {}, batch.entries[file].received, {}, "offset"};
+        }
         if (status >= 500) {
           session.pending.reset();
         }
@@ -152,9 +161,13 @@ namespace platf {
       session.last_id = batch.id;
       session.last_revision = revision;
       session.pending.reset();
+      return {204, {}, {}, revision};
     }
-    if (status == 204 || (status == 409 && since && revision != *since)) {
-      return {status, {}, {}, revision};
+    if (status == 423) {
+      return {409, {}, {}, {}, "busy"};
+    }
+    if (status == 409) {
+      return {409, {}, {}, revision, "sequence"};
     }
     return {status};
   }

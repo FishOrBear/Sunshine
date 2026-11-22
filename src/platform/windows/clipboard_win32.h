@@ -419,16 +419,21 @@ namespace win_clipboard {
     }
     // EmptyClipboard requires a real clipboard owner to publish data.
     HWND owner = CreateWindowExW(0, L"STATIC", nullptr, 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, nullptr, nullptr);
-    int status = 409;
+    int status = 500;
     if (owner) {
       detail::clipboard_lock lock(owner);
-      if (lock.opened) {
+      if (!lock.opened) {
+        // Another process can hold the clipboard while Explorer is switching focus.
+        status = 423;
+      } else {
         sequence = GetClipboardSequenceNumber();
-      }
-      if (lock.opened && (!expected || *expected == sequence) && EmptyClipboard() && SetClipboardData(files ? CF_HDROP : CF_UNICODETEXT, data)) {
-        data = nullptr;
-        sequence = GetClipboardSequenceNumber();
-        status = 204;
+        if (expected && *expected != sequence) {
+          status = 409;
+        } else if (EmptyClipboard() && SetClipboardData(files ? CF_HDROP : CF_UNICODETEXT, data)) {
+          data = nullptr;
+          sequence = GetClipboardSequenceNumber();
+          status = 204;
+        }
       }
     }
     if (owner && status == 204) {
@@ -492,6 +497,7 @@ namespace win_clipboard {
     if (batch.published && format == 'F') {
       detail::expire_batches(staging_root, batch.directory);
     }
-    return status;
+    // The original single-packet protocol reports temporary clipboard contention as a conflict.
+    return status == 423 ? 409 : status;
   }
 }  // namespace win_clipboard

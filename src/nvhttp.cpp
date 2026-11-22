@@ -8,6 +8,7 @@
 // standard includes
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <filesystem>
@@ -1778,6 +1779,19 @@ namespace nvhttp {
       }
       if (result.sequence) {
         headers.emplace("X-Clipboard-Sequence", std::to_string(*result.sequence));
+      }
+      if (!result.conflict.empty()) {
+        headers.emplace("X-Clipboard-Conflict", result.conflict);
+      }
+      if (result.status >= 400) {
+        // Report only fixed operation names, offsets and status; limit repeated failures.
+        static std::atomic<std::int64_t> next_log_ms {};
+        const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        auto next = next_log_ms.load(std::memory_order_relaxed);
+        if (now >= next && next_log_ms.compare_exchange_strong(next, now + 1000, std::memory_order_relaxed)) {
+          const auto phase = op == "begin" || op == "chunk" || op == "commit" || op == "abort" ? op : "unknown";
+          BOOST_LOG(warning) << "Clipboard file batch " << phase << " failed, HTTP " << result.status << ", offset " << offset << ", reason " << (result.conflict.empty() ? "unspecified"sv : result.conflict);
+        }
       }
       response->write(static_cast<status>(result.status), result.id, headers);
     } catch (const std::exception &) {

@@ -22,6 +22,7 @@ namespace platf {
     std::string id {};  ///< Identifier issued by begin.
     std::optional<std::uint64_t> offset {};  ///< Acknowledged next byte on a chunk.
     std::optional<std::uint32_t> sequence {};  ///< Host revision after publication or a commit conflict.
+    std::string_view conflict {};  ///< Fixed, non-sensitive reason returned for HTTP 409.
   };
 
   /** @brief Execute a file-batch operation under the interactive user's token. */
