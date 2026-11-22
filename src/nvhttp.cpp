@@ -502,6 +502,9 @@ namespace nvhttp {
       tree.put("root.clipboardversion", 1);
       tree.put("root.clipboardtext", grant.formats.text ? 1 : 0);
       tree.put("root.clipboardfiles", grant.formats.files ? 1 : 0);
+      if (grant.formats.upload_session) {
+        tree.put("root.clipboardbatchversion", 1);
+      }
     }
   }
 
@@ -572,6 +575,9 @@ namespace nvhttp {
         {get_arg(args, "clipboardtext", "0") == "1", get_arg(args, "clipboardfiles", "0") == "1"},
         get_arg(args, "clipboardtoken", "")
       );
+      if (launch_session->clipboard_grant.formats.files) {
+        launch_session->clipboard_grant.formats.upload_session = platf::make_clipboard_upload_session();
+      }
     }
 #endif
 
@@ -1713,6 +1719,72 @@ namespace nvhttp {
   }
 
 #ifdef _WIN32
+  /** @brief Read a complete decimal unsigned integer without accepting prefixes or trailing characters. */
+  template<class UInt>
+  bool parse_clipboard_number(std::string_view str, UInt &value) {
+    const auto end = str.data() + str.size();
+    const auto result = std::from_chars(str.data(), end, value);
+    return !str.empty() && result.ec == std::errc {} && result.ptr == end;
+  }
+
+  /** @brief Receive a bounded part of a file batch for a live, paired, file-enabled stream. */
+  void handle_clipboard_batch(resp_https_t response, req_https_t request, const std::string &cert) {
+    using status = SimpleWeb::StatusCode;
+    const auto token = request->header.find("X-Clipboard-Token");
+    const auto grant = token == request->header.end() ? clipboard::formats_t {} : rtsp_stream::clipboard_formats(cert, token->second);
+    if (!grant.files || !grant.upload_session) {
+      response->write(status::client_error_forbidden);
+      return;
+    }
+    const auto active = [&] {
+      {
+        std::lock_guard lock {client_auth_mutex()};
+        if (!is_client_enabled(crypto::x509(cert).get())) {
+          return false;
+        }
+      }
+      return rtsp_stream::clipboard_formats(cert, token->second).upload_session == grant.upload_session;
+    };
+    if (!active()) {
+      response->write(status::client_error_forbidden);
+      return;
+    }
+    const auto args = request->parse_query_string();
+    const auto op = get_arg(args, "op", "");
+    const auto id = get_arg(args, "id", "");
+    const auto length = request->content.size();
+    if (length > (op == "chunk" ? 4U * 1024 * 1024 : 64U * 1024)) {
+      response->write(status::client_error_payload_too_large);
+      return;
+    }
+    std::uint64_t offset {};
+    std::uint32_t file {};
+    std::optional<std::uint32_t> since;
+    if (op == "chunk" && (!parse_clipboard_number(get_arg(args, "offset", ""), offset) || !parse_clipboard_number(get_arg(args, "file", ""), file))) {
+      response->write(status::client_error_bad_request);
+      return;
+    }
+    if (const auto it = args.find("since"); it != args.end()) {
+      if (op != "commit" || !parse_clipboard_number(it->second, since.emplace())) {
+        response->write(status::client_error_bad_request);
+        return;
+      }
+    }
+    try {
+      const auto result = platf::exchange_clipboard_batch(*grant.upload_session, op, id, file, offset, since, request->content.string(), active);
+      SimpleWeb::CaseInsensitiveMultimap headers {{"Cache-Control", "no-store"}};
+      if (result.offset) {
+        headers.emplace("X-Clipboard-Offset", std::to_string(*result.offset));
+      }
+      if (result.sequence) {
+        headers.emplace("X-Clipboard-Sequence", std::to_string(*result.sequence));
+      }
+      response->write(static_cast<status>(result.status), result.id, headers);
+    } catch (const std::exception &) {
+      response->write(status::server_error_internal_server_error);
+    }
+  }
+
   /** @brief Exchange clipboard contents over the authenticated connection of a running stream. */
   void handle_clipboard(resp_https_t response, req_https_t request, const std::string &cert) {
     using status = SimpleWeb::StatusCode;
@@ -1905,6 +1977,9 @@ namespace nvhttp {
 #ifdef _WIN32
     // Bound the TLS server's buffering before the request reaches a clipboard handler.
     https_server.config.max_request_streambuf_size = 16 * 1024 * 1024;
+    https_server.resource["^/clipboard/batch$"]["POST"] = [&](auto resp, auto req) {
+      handle_clipboard_batch(resp, req, https_server.client_identity(*req).first);
+    };
     for (const auto *method : {"GET", "POST"}) {
       https_server.resource["^/clipboard$"][method] = [&](auto resp, auto req) {
         handle_clipboard(resp, req, https_server.client_identity(*req).first);

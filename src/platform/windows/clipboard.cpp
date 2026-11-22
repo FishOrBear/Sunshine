@@ -4,7 +4,10 @@
  */
 #include "clipboard.h"
 
+#include "clipboard_upload.h"
 #include "clipboard_win32.h"
+
+#include <mutex>
 
 namespace platf {
   namespace {
@@ -57,6 +60,105 @@ namespace platf {
     }
   }  // namespace
 
+  /** @brief Pending and most recently committed batches belong only to this stream. */
+  struct clipboard_upload_session_t {
+    std::mutex mutex;  ///< Serializes begin, append, commit and cancellation.
+    std::unique_ptr<clipboard_upload::batch_t> pending;  ///< Partial files removed when the stream is destroyed.
+    LUID logon {};  ///< Interactive logon that owns the pinned files.
+    std::string last_id;  ///< Support retries when the commit acknowledgement was lost.
+    DWORD last_revision {};  ///< Revision that still identifies the last published batch.
+  };
+
+  std::shared_ptr<clipboard_upload_session_t> make_clipboard_upload_session() {
+    return std::make_shared<clipboard_upload_session_t>();
+  }
+
+  /** @brief Resolve clipboard staging under the impersonated shell owner's local profile. */
+  int clipboard_staging_root(HANDLE token, const wchar_t *folder, std::filesystem::path &path) {
+    PWSTR app_data {};
+    if (FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, token, &app_data))) {
+      return 500;
+    }
+    auto release = std::unique_ptr<wchar_t, decltype(&CoTaskMemFree)>(app_data, &CoTaskMemFree);
+    path = std::filesystem::path(app_data) / L"Sunshine" / folder;
+    return 200;
+  }
+
+  clipboard_upload_result_t exchange_clipboard_batch(clipboard_upload_session_t &session, std::string_view op, std::string_view id, std::uint32_t file, std::uint64_t offset, std::optional<std::uint32_t> since, std::string_view input, const std::function<bool()> &grant_active) {
+    shell_impersonation_t user;
+    if (!user.begin() || !on_user_desktop()) {
+      return {409};
+    }
+    TOKEN_STATISTICS stats {};
+    DWORD needed {};
+    if (!GetTokenInformation(user.token, TokenStatistics, &stats, sizeof(stats), &needed)) {
+      return {403};
+    }
+    std::lock_guard lock(session.mutex);
+    if (!grant_active()) {
+      return {403};
+    }
+    if (op == "begin") {
+      if (!id.empty()) {
+        return {400};
+      }
+      std::filesystem::path root;
+      if (clipboard_staging_root(user.token, L"ClipboardUploads", root) != 200) {
+        return {500};
+      }
+      session.pending.reset();
+      auto batch = std::make_unique<clipboard_upload::batch_t>();
+      int status = batch->begin(root, input);
+      if (status != 200) {
+        return {status};
+      }
+      session.logon = stats.AuthenticationId;
+      session.last_id.clear();
+      session.pending = std::move(batch);
+      return {200, session.pending->id};
+    }
+
+    if (session.logon.HighPart != stats.AuthenticationId.HighPart || session.logon.LowPart != stats.AuthenticationId.LowPart) {
+      return {403};
+    }
+    if (op == "commit" && !id.empty() && id == session.last_id && input.empty()) {
+      auto revision = GetClipboardSequenceNumber();
+      return {revision == session.last_revision ? 204 : 409, {}, {}, revision};
+    }
+    if (!session.pending || session.pending->id != id) {
+      return {404};
+    }
+    auto &batch = *session.pending;
+    if (op == "abort" && input.empty()) {
+      session.pending.reset();
+      return {204};
+    }
+    if (op == "chunk") {
+      int status = batch.append(file, offset, input);
+      if (status != 204) {
+        if (status >= 500) {
+          session.pending.reset();
+        }
+        return {status};
+      }
+      return {204, {}, batch.entries[file].received};
+    }
+    if (op != "commit" || !input.empty()) {
+      return {400};
+    }
+    DWORD revision = GetClipboardSequenceNumber();
+    int status = batch.commit(since, revision, grant_active);
+    if (status == 204) {
+      session.last_id = batch.id;
+      session.last_revision = revision;
+      session.pending.reset();
+    }
+    if (status == 204 || (status == 409 && since && revision != *since)) {
+      return {status, {}, {}, revision};
+    }
+    return {status};
+  }
+
   std::uint32_t clipboard_sequence() {
     return GetClipboardSequenceNumber();
   }
@@ -82,12 +184,9 @@ namespace platf {
     if (upload) {
       std::filesystem::path staging;
       if (formats.files && !input.empty() && input.front() == 'F') {
-        PWSTR app_data {};
-        if (FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, user.token, &app_data))) {
+        if (clipboard_staging_root(user.token, L"Clipboard", staging) != 200) {
           return 500;
         }
-        auto release = std::unique_ptr<wchar_t, decltype(&CoTaskMemFree)>(app_data, &CoTaskMemFree);
-        staging = std::filesystem::path(app_data) / L"Sunshine" / L"Clipboard";
       }
       status = win_clipboard::write(formats.text, formats.files, input, current, staging, since, grant_active);
     } else {

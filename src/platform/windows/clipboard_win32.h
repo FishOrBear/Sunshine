@@ -256,17 +256,15 @@ namespace win_clipboard {
       return true;
     }
 
-    // Retain recent Explorer paste sources across disconnects. Each directory
-    // contains at most 16 MiB, so keeping 16 batches bounds normal use to 256 MiB.
     /** @brief Clean up expired batches and bound the number of retained paste sources. */
-    inline void expire_batches(const fs::path &root, const fs::path &current) {
+    inline void expire_batches(const fs::path &root, const fs::path &current, size_t keep = 16) {
       const auto cutoff = fs::file_time_type::clock::now() - std::chrono::hours(24);
       std::error_code ec;
       std::vector<std::pair<fs::file_time_type, fs::path>> previous;
       for (fs::directory_iterator dir(root, ec), end; !ec && dir != end; dir.increment(ec)) {
         const auto &path = dir->path();
         const auto attrs = GetFileAttributesW(path.c_str());
-        if (path == current || attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_DIRECTORY) || attrs & FILE_ATTRIBUTE_REPARSE_POINT || !batch_name(path.filename().native())) {
+        if (CompareStringOrdinal(path.c_str(), -1, current.c_str(), -1, TRUE) == CSTR_EQUAL || attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_DIRECTORY) || attrs & FILE_ATTRIBUTE_REPARSE_POINT || !batch_name(path.filename().native())) {
           continue;
         }
         std::error_code batch_error;
@@ -278,7 +276,7 @@ namespace win_clipboard {
       std::sort(previous.rbegin(), previous.rend());
       size_t retained = 1;
       for (const auto &[modified, path] : previous) {
-        if (modified >= cutoff && retained < 16) {
+        if (modified >= cutoff && retained < keep) {
           ++retained;
           continue;
         }
@@ -408,6 +406,48 @@ namespace win_clipboard {
     return GetClipboardSequenceNumber() == sequence ? 200 : 409;
   }
 
+  /** @brief Publish text or a NUL-separated list of fully staged file paths under a final stream and revision guard. */
+  inline int publish(std::wstring_view value, bool files, DWORD &sequence, std::optional<DWORD> expected, const std::function<bool()> &grant_active) {
+    HGLOBAL data = detail::make_data(value, files);
+    if (!data) {
+      return 500;
+    }
+    // File staging may outlive the requesting stream. Check again before touching the clipboard.
+    if (grant_active && !grant_active()) {
+      GlobalFree(data);
+      return 403;
+    }
+    // EmptyClipboard requires a real clipboard owner to publish data.
+    HWND owner = CreateWindowExW(0, L"STATIC", nullptr, 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, nullptr, nullptr);
+    int status = 409;
+    if (owner) {
+      detail::clipboard_lock lock(owner);
+      if (lock.opened) {
+        sequence = GetClipboardSequenceNumber();
+      }
+      if (lock.opened && (!expected || *expected == sequence) && EmptyClipboard() && SetClipboardData(files ? CF_HDROP : CF_UNICODETEXT, data)) {
+        data = nullptr;
+        sequence = GetClipboardSequenceNumber();
+        status = 204;
+      }
+    }
+    if (owner && status == 204) {
+      // Windows may synthesize additional text formats when CloseClipboard
+      // publishes the update. Record the final sequence under a fresh lock.
+      detail::clipboard_lock lock(owner);
+      if (lock.opened && GetClipboardOwner() == owner) {
+        sequence = GetClipboardSequenceNumber();
+      }
+    }
+    if (owner) {
+      DestroyWindow(owner);
+    }
+    if (data) {
+      GlobalFree(data);
+    }
+    return status;
+  }
+
   /** @brief Apply a clipboard packet, optionally only if the current sequence still matches. */
   inline int write(bool text, bool files, std::string_view payload, DWORD &sequence, const fs::path &staging_root, std::optional<DWORD> expected = std::nullopt, const std::function<bool()> &grant_active = {}) {
     if (payload.empty()) {
@@ -447,41 +487,8 @@ namespace win_clipboard {
       return 400;
     }
 
-    HGLOBAL data = detail::make_data(value, format == 'F');
-    if (!data) {
-      return 500;
-    }
-    // File staging may outlive the requesting stream. Check again before touching the clipboard.
-    if (grant_active && !grant_active()) {
-      GlobalFree(data);
-      return 403;
-    }
-    // EmptyClipboard requires a real clipboard owner to publish data.
-    HWND owner = CreateWindowExW(0, L"STATIC", nullptr, 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, nullptr, nullptr);
-    int status = 409;
-    if (owner) {
-      detail::clipboard_lock lock(owner);
-      if (lock.opened && (!expected || *expected == GetClipboardSequenceNumber()) && EmptyClipboard() && SetClipboardData(format == 'F' ? CF_HDROP : CF_UNICODETEXT, data)) {
-        data = nullptr;
-        sequence = GetClipboardSequenceNumber();
-        batch.published = true;
-        status = 204;
-      }
-    }
-    if (owner && status == 204) {
-      // Windows may synthesize additional text formats when CloseClipboard
-      // publishes the update. Record the final sequence under a fresh lock.
-      detail::clipboard_lock lock(owner);
-      if (lock.opened && GetClipboardOwner() == owner) {
-        sequence = GetClipboardSequenceNumber();
-      }
-    }
-    if (owner) {
-      DestroyWindow(owner);
-    }
-    if (data) {
-      GlobalFree(data);
-    }
+    const int status = publish(value, format == 'F', sequence, expected, grant_active);
+    batch.published = status == 204;
     if (batch.published && format == 'F') {
       detail::expire_batches(staging_root, batch.directory);
     }

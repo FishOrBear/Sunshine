@@ -11,6 +11,7 @@
 #ifdef _WIN32
   // platform includes
   #include "src/platform/windows/clipboard.h"
+  #include "src/platform/windows/clipboard_upload.h"
   #include "src/platform/windows/clipboard_win32.h"
 #endif
 
@@ -87,5 +88,53 @@ TEST(ClipboardCodecTest, RejectsDisallowedOrMalformedWritesBeforeOpeningClipboar
   EXPECT_EQ(win_clipboard::write(true, true, std::string("T\xff", 2), sequence, {}), 400);
   EXPECT_EQ(win_clipboard::write(true, true, std::string(win_clipboard::max_text + 2, 'T'), sequence, {}), 413);
   EXPECT_EQ(win_clipboard::write(true, true, std::string(win_clipboard::max_body + 1, 'F'), sequence, {}), 413);
+}
+
+TEST(ClipboardBatchTest, RejectsInvalidManifestsAndUses64BitLengths) {
+  using namespace platf::clipboard_upload;
+  for (const auto &body : {"[]", "{}", "[null]", R"([{"name":"../bad","size":5}])", R"([{"name":"A","size":5},{"name":"a","size":5}])", R"([{"name":"ok","size":-1}])", R"([{"name":"ok","size":1.5}])"}) {
+    std::vector<entry_t> entries;
+    std::uint64_t total {};
+    EXPECT_EQ(manifest(body, entries, total), 400);
+  }
+  std::vector<entry_t> entries;
+  std::uint64_t total {};
+  EXPECT_EQ(manifest(R"([{"name":"large.bin","size":4294967297}])", entries, total), 200);
+  EXPECT_EQ(total, 4294967297ULL);
+  entries.clear();
+  total = 0;
+  EXPECT_EQ(manifest(R"([{"name":"a","size":17179869184},{"name":"b","size":1}])", entries, total), 413);
+}
+
+TEST(ClipboardBatchTest, RejectsMissingOrOutOfOrderBytesAndCleansUpRevokedBatches) {
+  using namespace platf::clipboard_upload;
+  const auto root = fs::temp_directory_path() / ("sunshine-upload-test-" + std::to_string(GetCurrentProcessId()));
+  const std::string bytes(chunk_limit, 'z');
+  const auto original = GetClipboardSequenceNumber();
+  {
+    batch_t batch;
+    ASSERT_EQ(batch.begin(root, R"([{"name":"large.bin","size":20971521},{"name":"empty","size":0}])"), 200);
+    EXPECT_EQ(batch.id.size(), 32U);
+    DWORD revision {};
+    EXPECT_EQ(batch.append(2, 0, "x"), 400);
+    EXPECT_EQ(batch.append(0, 1, "x"), 409);
+    EXPECT_EQ(batch.append(1, 0, "x"), 413);
+    EXPECT_EQ(batch.commit({}, revision, [] {
+      return false;
+    }),
+              400);
+    for (std::uint64_t offset = 0; offset < 5 * chunk_limit; offset += chunk_limit) {
+      ASSERT_EQ(batch.append(0, offset, bytes), 204);
+      EXPECT_EQ(batch.append(0, offset, bytes), 409);
+    }
+    ASSERT_EQ(batch.append(0, 5 * chunk_limit, "!"), 204);
+    EXPECT_EQ(batch.commit({}, revision, [] {
+      return false;
+    }),
+              403);
+    EXPECT_EQ(GetClipboardSequenceNumber(), original);
+  }
+  EXPECT_TRUE(fs::is_empty(root));
+  fs::remove(root);
 }
 #endif
