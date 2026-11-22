@@ -35,10 +35,11 @@ namespace platf {
     std::optional<std::uint64_t> offset {};  ///< Acknowledged next byte on a chunk.
     std::optional<std::uint32_t> sequence {};  ///< Host revision after publication or a commit conflict.
     std::string_view conflict {};  ///< Fixed, non-sensitive reason returned for HTTP 409.
+    std::string task {};  ///< Canonical task selected for a captured paste gesture.
   };
 
   /** @brief Execute a file-batch operation under the interactive user's token. */
-  clipboard_upload_result_t exchange_clipboard_batch(clipboard_upload_session_t &session, std::string_view op, std::string_view id, std::uint32_t file, std::uint64_t offset, std::optional<std::uint32_t> since, std::string_view input, const std::function<bool()> &grant_active);
+  clipboard_upload_result_t exchange_clipboard_batch(clipboard_upload_session_t &session, std::string_view op, std::string_view id, std::uint32_t file, std::uint64_t offset, std::optional<std::uint32_t> since, std::string_view input, const std::function<bool()> &grant_active, std::string_view task = {}, std::string_view previous = {});
 
   /** @brief Return the clipboard sequence at stream startup without retrieving its contents. */
   std::uint32_t clipboard_sequence();

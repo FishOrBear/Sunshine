@@ -27,46 +27,6 @@ namespace platf {
       return to_utf8(path.generic_wstring());
     }
 
-    /** @brief Restrict access to mounted local volumes. */
-    bool local_volume(const fs::path &root) {
-      const auto chars = root.native();
-      if (chars.size() != 3 || chars[1] != L':' || chars[2] != L'\\' || !((chars[0] >= L'A' && chars[0] <= L'Z') || (chars[0] >= L'a' && chars[0] <= L'z'))) {
-        return false;
-      }
-      const auto type = GetDriveTypeW(chars.c_str());
-      return type == DRIVE_FIXED || type == DRIVE_REMOVABLE || type == DRIVE_RAMDISK;
-    }
-
-    /** @brief Hold each directory without delete sharing to prevent a concurrent junction swap. */
-    int pin_directory(const fs::path &dir, std::vector<file_handle> &pins) {
-      auto current = dir.root_path();
-      if (!local_volume(current)) {
-        return 400;
-      }
-      for (const auto &part : dir.relative_path()) {
-        if (part.empty()) {
-          continue;
-        }
-        if (!valid_name(part.native())) {
-          return 400;
-        }
-        current /= part;
-        HANDLE raw = CreateFileW(current.c_str(), FILE_TRAVERSE | FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
-        if (raw == INVALID_HANDLE_VALUE) {
-          return file_error();
-        }
-        pins.emplace_back(raw);
-        BY_HANDLE_FILE_INFORMATION info {};
-        if (!GetFileInformationByHandle(raw, &info)) {
-          return file_error();
-        }
-        if (!(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
-          return 403;
-        }
-      }
-      return 200;
-    }
-
     /** @brief Verify that the current desktop user can actually list a local directory. */
     bool can_list_place(const fs::path &dir) {
       std::vector<file_handle> pins;

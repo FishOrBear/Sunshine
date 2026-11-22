@@ -511,6 +511,9 @@ namespace nvhttp {
       tree.put("root.clipboardfiles", grant.formats.files ? 1 : 0);
       if (grant.formats.upload_session) {
         tree.put("root.clipboardbatchversion", grant.formats.resumable ? 2 : 1);
+        if (grant.formats.resumable) {
+          tree.put("root.clipboardmultitask", 1);
+        }
       }
     }
   }
@@ -1851,8 +1854,7 @@ namespace nvhttp {
     std::optional<std::int64_t> modified;
     const auto timestamp = get_arg(args, "modified", "");
     const bool chunk = op == "write" || op == "read" || op == "chunk";
-    if ((chunk && !parse(get_arg(args, "offset", ""), offset)) ||
-        ((chunk || op == "resume" || op == "identity") && !parse(get_arg(args, "size", ""), size))) {
+    if ((chunk && !parse(get_arg(args, "offset", ""), offset)) || ((chunk || op == "resume" || op == "identity") && !parse(get_arg(args, "size", ""), size))) {
       response->write(status::client_error_bad_request);
       return;
     }
@@ -1915,7 +1917,9 @@ namespace nvhttp {
     const auto args = request->parse_query_string();
     const auto op = get_arg(args, "op", "");
     const auto id = get_arg(args, "id", "");
-    if (!grant.resumable && (op == "resume" || op == "discard")) {
+    const auto task = get_arg(args, "task", "");
+    const auto previous = get_arg(args, "previous", "");
+    if ((!grant.resumable && (op == "resume" || op == "discard" || !task.empty())) || (args.count("task") && (args.count("task") != 1 || task.empty())) || ((op == "target" || op == "deliver") && task.empty()) || (args.count("previous") && (op != "target" || args.count("previous") != 1 || previous.empty()))) {
       response->write(status::client_error_bad_request);
       return;
     }
@@ -1938,8 +1942,11 @@ namespace nvhttp {
       }
     }
     try {
-      const auto result = platf::exchange_clipboard_batch(*grant.upload_session, op, id, file, offset, since, request->content.string(), active);
+      const auto result = platf::exchange_clipboard_batch(*grant.upload_session, op, id, file, offset, since, request->content.string(), active, task, previous);
       SimpleWeb::CaseInsensitiveMultimap headers {{"Cache-Control", "no-store"}};
+      if (!result.task.empty()) {
+        headers.emplace("X-Clipboard-Task", result.task);
+      }
       if (result.offset) {
         headers.emplace("X-Clipboard-Offset", std::to_string(*result.offset));
       }
@@ -1955,7 +1962,7 @@ namespace nvhttp {
         const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
         auto next = next_log_ms.load(std::memory_order_relaxed);
         if (now >= next && next_log_ms.compare_exchange_strong(next, now + 1000, std::memory_order_relaxed)) {
-          const auto phase = op == "begin" || op == "resume" || op == "discard" || op == "chunk" || op == "commit" || op == "abort" ? op : "unknown";
+          const auto phase = op == "begin" || op == "resume" || op == "discard" || op == "chunk" || op == "commit" || op == "abort" || op == "target" || op == "deliver" ? op : "unknown";
           BOOST_LOG(warning) << "Clipboard file batch " << phase << " failed, HTTP " << result.status << ", offset " << offset << ", reason " << (result.conflict.empty() ? "unspecified"sv : result.conflict);
         }
       }

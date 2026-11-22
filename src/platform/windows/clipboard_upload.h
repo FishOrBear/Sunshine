@@ -5,7 +5,7 @@
 #pragma once
 
 #include "clipboard_win32.h"
-#include "file_digest.h"
+#include "file_transfer.h"
 
 #include <nlohmann/json.hpp>
 
@@ -23,6 +23,17 @@ namespace platf::clipboard_upload {
     file_handle handle;  ///< Pinned destination file.
     std::string sha256;  ///< Expected content digest for resumable files.
     file_digest_t hash;  ///< Incremental content digest when verification is enabled.
+
+    /** @brief Initialize verification before creating either kind of staging file. */
+    int start_digest() {
+      if (sha256.empty()) {
+        return 200;
+      }
+      if (!hash.start()) {
+        return 500;
+      }
+      return !size && hash.finish() != sha256 ? 422 : 200;
+    }
   };
 
   /** @brief Validate all metadata before creating any files. */
@@ -185,13 +196,9 @@ namespace platf::clipboard_upload {
       }
       directory_handle.reset(dir);
       for (auto &entry : entries) {
-        if (!entry.sha256.empty()) {
-          if (!entry.hash.start()) {
-            return 500;
-          }
-          if (!entry.size && entry.hash.finish() != entry.sha256) {
-            return 422;
-          }
+        const auto status = entry.start_digest();
+        if (status != 200) {
+          return status;
         }
         auto file = CreateFileW((directory / entry.name).c_str(), GENERIC_WRITE | DELETE, FILE_SHARE_READ, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
         if (file == INVALID_HANDLE_VALUE) {
@@ -203,6 +210,89 @@ namespace platf::clipboard_upload {
         }
       }
       return 200;
+    }
+
+    /** @brief Put partial files on the pinned Explorer volume, without touching unrelated directory entries. */
+    int stage_for_delivery(const fs::path &target, std::uint64_t total) {
+      std::error_code ec;
+      const auto space = fs::space(target, ec);
+      if (ec) {
+        return 500;
+      }
+      if (space.available < total) {
+        return 507;
+      }
+      for (auto &entry : entries) {
+        auto status = entry.start_digest();
+        if (status == 200) {
+          status = file_transfer::create_staging_in(target, entry.handle, FILE_ATTRIBUTE_HIDDEN | FILE_FLAG_SEQUENTIAL_SCAN);
+        }
+        if (status != 200) {
+          return status;
+        }
+      }
+      return 200;
+    }
+
+    /** @brief Preserve both files when the Explorer folder already contains the supplied name. */
+    static fs::path copy_name(const fs::path &original, unsigned int number) {
+      if (number == 1) {
+        return original;
+      }
+      const auto suffix = L" (" + std::to_wstring(number) + L")";
+      auto extension = original.extension().native();
+      // Leave room for a stem and the counter even for an unusually long extension.
+      extension.resize((std::min) (extension.size(), 254U - suffix.size()));
+      auto stem = original.stem().native();
+      stem.resize((std::min) (stem.size(), 255U - suffix.size() - extension.size()));
+      if (!stem.empty() && IS_HIGH_SURROGATE(stem.back())) {
+        stem.pop_back();
+      }
+      if (!extension.empty() && IS_HIGH_SURROGATE(extension.back())) {
+        extension.pop_back();
+      }
+      return stem + suffix + extension;
+    }
+
+    /** @brief Deliver verified files using same-volume no-replace renames and remember completed entries on retry. */
+    int deliver(const fs::path &target, const std::function<bool()> &active) {
+      if (std::any_of(entries.begin(), entries.end(), [](const auto &entry) {
+            return entry.received != entry.size;
+          })) {
+        return 400;
+      }
+      for (auto &entry : entries) {
+        if (!entry.handle) {
+          continue;
+        }
+        FILE_BASIC_INFO visible {};
+        visible.FileAttributes = FILE_ATTRIBUTE_ARCHIVE;
+        if (!SetFileInformationByHandle(entry.handle.get(), FileBasicInfo, &visible, sizeof(visible))) {
+          return file_transfer::file_error();
+        }
+        for (unsigned int number = 1; number <= 1024; ++number) {
+          const auto path = target / copy_name(entry.name, number);
+          if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            continue;
+          }
+          if (!active()) {
+            return 403;
+          }
+          const auto status = file_transfer::rename_staged_file(entry.handle.get(), path);
+          if (status == 204) {
+            entry.handle.reset();
+            break;
+          }
+          if (status != 409 || GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            return status;
+          }
+        }
+        if (entry.handle) {
+          return 409;
+        }
+      }
+      published = true;
+      return 204;
     }
 
     /** @brief Append exactly the next bytes within the declared file size. */

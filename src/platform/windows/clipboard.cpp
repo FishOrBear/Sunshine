@@ -54,7 +54,7 @@ namespace platf {
     return 200;
   }
 
-  clipboard_upload_result_t exchange_clipboard_batch(clipboard_upload_session_t &session, std::string_view op, std::string_view id, std::uint32_t file, std::uint64_t offset, std::optional<std::uint32_t> since, std::string_view input, const std::function<bool()> &grant_active) {
+  clipboard_upload_result_t exchange_clipboard_batch(clipboard_upload_session_t &session, std::string_view op, std::string_view id, std::uint32_t file, std::uint64_t offset, std::optional<std::uint32_t> since, std::string_view input, const std::function<bool()> &grant_active, std::string_view task, std::string_view previous) {
     desktop::shell_impersonation_t user;
     if (!user.begin()) {
       return {409, {}, {}, {}, "shell"};
@@ -66,6 +66,21 @@ namespace platf {
     DWORD needed {};
     if (!GetTokenInformation(user.token, TokenStatistics, &stats, sizeof(stats), &needed)) {
       return {403};
+    }
+    if (!task.empty()) {
+      const auto permitted = [&] {
+        return grant_active() && desktop::on_user_desktop();
+      };
+      if (op == "target") {
+        if (!input.empty() || !id.empty() || since) {
+          return {400};
+        }
+        const auto capture = [&](auto &target) {
+          return clipboard_upload::capture_paste_target(user.token, target);
+        };
+        return resume_cache().capture_target(session.cert, stats.AuthenticationId, session.serial, task, clipboard_upload::resume_cache_t::clock::now(), permitted, capture, previous);
+      }
+      return resume_cache().exchange({}, session.cert, stats.AuthenticationId, session.serial, op, id, file, offset, since, input, permitted, task);
     }
     std::lock_guard lock(session.mutex);
     if (!grant_active()) {
