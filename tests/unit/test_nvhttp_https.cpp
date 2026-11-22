@@ -157,4 +157,42 @@ namespace {
     server->io_service->run_for(2s);
     EXPECT_EQ(error_callbacks, 0);
   }
+
+  /** @brief A peer that withholds its TLS close alert must not stall subsequent HTTPS requests. */
+  TEST_F(HttpsHandlerLifetimeTest, ServesNextClientWhilePreviousPeerWithholdsCloseNotify) {
+    server->resource["^/probe$"]["GET"] = [](auto response, auto) {
+      response->write("ok");
+      response->close_connection_after_response = true;
+    };
+    std::jthread server_thread {[this] {
+      server->io_service->run();
+    }};
+    boost::asio::io_context io;
+    boost::asio::ssl::context tls {boost::asio::ssl::context::tls_client};
+    auto request = [this](auto &stream) {
+      stream.lowest_layer().connect({boost::asio::ip::address_v4::loopback(), port});
+      stream.handshake(boost::asio::ssl::stream_base::client);
+      const std::string get = "GET /probe HTTP/1.1\r\nHost: localhost\r\n\r\n";
+      boost::asio::write(stream, boost::asio::buffer(get));
+      boost::asio::streambuf headers;
+      boost::asio::read_until(stream, headers, "\r\n\r\n");
+      std::string status;
+      std::getline(std::istream {&headers}, status);
+      return status;
+    };
+
+    boost::asio::ssl::stream<tcp::socket> first {io, tls};
+    auto stop_server = util::fail_guard([this] { server->stop(); });
+    EXPECT_EQ(request(first), "HTTP/1.1 200 OK\r");
+    auto next = std::async(std::launch::async, [&] {
+      boost::asio::io_context next_io;
+      boost::asio::ssl::stream<tcp::socket> second {next_io, tls};
+      return request(second);
+    });
+    const auto ready = next.wait_for(2s);
+    // Release a blocking implementation too, so the regression reports a failure and tears down.
+    first.lowest_layer().close();
+    EXPECT_EQ(ready, std::future_status::ready);
+    EXPECT_EQ(next.get(), "HTTP/1.1 200 OK\r");
+  }
 }  // namespace

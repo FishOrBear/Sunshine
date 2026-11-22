@@ -13,6 +13,8 @@
   #include "src/platform/windows/clipboard.h"
   #include "src/platform/windows/clipboard_upload.h"
   #include "src/platform/windows/clipboard_win32.h"
+
+  #include <thread>
 #endif
 
 TEST(ClipboardGrantTest, RequiresMutualConsentAndValidCapability) {
@@ -105,6 +107,49 @@ TEST(ClipboardBatchTest, RejectsInvalidManifestsAndUses64BitLengths) {
   total = 0;
   EXPECT_EQ(manifest(R"([{"name":"a","size":17179869184},{"name":"b","size":1}])", entries, total), 413);
 }
+
+  #ifdef GTEST_HAS_DEATH_TEST
+namespace {
+  void check_clipboard_publication() {
+    const auto name = L"SunshineClipboardTest-" + std::to_wstring(GetCurrentProcessId());
+    const auto station = CreateWindowStationW(name.c_str(), 0, WINSTA_ALL_ACCESS, nullptr);
+    ASSERT_TRUE(station && SetProcessWindowStation(station));
+    const auto desktop = CreateDesktopW(L"Private", nullptr, nullptr, 0, GENERIC_ALL, nullptr);
+    ASSERT_TRUE(desktop && SetThreadDesktop(desktop));
+
+    const auto original = GetClipboardSequenceNumber();
+    DWORD sequence {};
+    int result {};
+    {
+      win_clipboard::detail::clipboard_lock held(nullptr);
+      ASSERT_TRUE(held.opened);
+      std::thread writer([&] {
+        result = win_clipboard::publish(L"example", false, sequence, original, {});
+      });
+      writer.join();
+    }
+    EXPECT_EQ(result, 423);
+    EXPECT_EQ(GetClipboardSequenceNumber(), original);
+    EXPECT_EQ(win_clipboard::publish(L"example", false, sequence, original + 1, {}), 409);
+    EXPECT_EQ(sequence, original);
+    EXPECT_EQ(win_clipboard::publish(L"example", false, sequence, original, {}), 204);
+    EXPECT_NE(sequence, original);
+  }
+}  // namespace
+
+// Death-test subprocesses capture stderr themselves, so use the plain GoogleTest fixture.
+GTEST_TEST(ClipboardPublicationDeathTest, DistinguishesBusyClipboardFromChangedRevisionBeforeRetry) {
+  // A fresh process and window station keep the user's clipboard untouched.
+  ASSERT_EXIT(
+    {
+      check_clipboard_publication();
+      std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+    },
+    ::testing::ExitedWithCode(0),
+    ""
+  );
+}
+  #endif
 
 TEST(ClipboardBatchTest, RejectsMissingOrOutOfOrderBytesAndCleansUpRevokedBatches) {
   using namespace platf::clipboard_upload;

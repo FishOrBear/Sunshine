@@ -106,9 +106,12 @@ namespace nvhttp {
     std::string client_name;  ///< Paired name of the same authenticated peer.
 
     virtual ~SunshineHTTPS() {
-      // Gracefully shutdown the TLS connection
+      // Send close_notify if possible, without waiting on a peer from the HTTPS event loop.
       SimpleWeb::error_code ec;
-      shutdown(ec);
+      lowest_layer().non_blocking(true, ec);
+      if (!ec) {
+        shutdown(ec);
+      }
     }
   };
 
