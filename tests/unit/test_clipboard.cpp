@@ -9,6 +9,10 @@
 #include "src/clipboard.h"
 
 #ifdef _WIN32
+  // standard includes
+  #include <fstream>
+  #include <thread>
+
   // platform includes
   #include "src/platform/windows/clipboard.h"
   #include "src/platform/windows/clipboard_resume.h"
@@ -16,7 +20,6 @@
   #include "src/platform/windows/clipboard_win32.h"
   #include "src/platform/windows/file_sessions.h"
 
-  #include <thread>
 #endif
 
 TEST(ClipboardGrantTest, RequiresMutualConsentAndValidCapability) {
@@ -302,12 +305,29 @@ namespace {
     std::uint64_t stream = 1;
     bool active = true;
     std::string lease;
+    std::string task;
+
+    platf::clipboard_upload_result_t choose(const fs::path &destination, std::string_view previous = {}) {
+      const auto resolve = [&](auto &target) {
+        target.directory = destination;
+        return platf::file_transfer::pin_directory(destination, target.pins);
+      };
+      const auto permitted = [&] {
+        return active;
+      };
+      return cache.capture_target(cert, logon, stream, task, decltype(cache)::clock::now(), permitted, resolve, previous);
+    }
+
+    int capture(const fs::path &destination) {
+      return choose(destination).status;
+    }
 
     platf::clipboard_upload_result_t send(std::string_view op, std::string_view bytes = {}, std::uint64_t offset = 0, std::optional<DWORD> since = {}) {
       const auto id = op == "resume" || op == "discard" ? std::string_view {} : std::string_view(lease);
       return cache.exchange(root, cert, logon, stream, op, id, 0, offset, since, bytes, [&] {
         return active;
-      });
+      },
+                            task);
     }
 
     void resume(std::uint64_t expected) {
@@ -322,6 +342,176 @@ namespace {
     }
   };
 }  // namespace
+
+TEST(ClipboardResumeTest, DeliversInterleavedPastesToTheirCapturedFoldersWithoutReplacingExistingFiles) {
+  resume_test_t t;
+  t.root += "-" + platf::new_file_lease();
+  const auto a = t.root / L"a";
+  const auto b = t.root / L"b";
+  ASSERT_TRUE(fs::create_directories(a));
+  ASSERT_TRUE(fs::create_directories(b));
+  std::ofstream(a / L"part") << "keep";
+  t.task.assign(32, 'a');
+  EXPECT_EQ(t.send("resume", resume_manifest).status, 404);
+  ASSERT_EQ(t.capture(a), 204);
+  ASSERT_EQ(t.capture(b), 204);
+  t.resume(0);
+  const auto a_lease = t.lease;
+  EXPECT_EQ(t.send("chunk", "a").status, 204);
+  EXPECT_EQ(t.send("deliver").status, 400);
+  t.task.assign(32, 'b');
+  ASSERT_EQ(t.capture(b), 204);
+  t.resume(0);
+  const auto b_lease = t.lease;
+  EXPECT_EQ(t.send("chunk", "abc").status, 204);
+  t.lease = a_lease;
+  EXPECT_EQ(t.send("abort").status, 404);
+  t.lease = b_lease;
+  EXPECT_EQ(t.send("commit", {}, 0, 0).status, 400);
+  EXPECT_EQ(t.send("deliver").status, 204);
+  EXPECT_EQ(t.send("deliver").status, 204);
+  EXPECT_FALSE(fs::exists(b / L"part (2)"));
+  t.task.assign(32, 'a');
+  ++t.stream;
+  auto changed = nlohmann::json::parse(resume_manifest);
+  changed[0]["name"] = "wrong";
+  EXPECT_EQ(t.send("resume", changed.dump()).conflict, "manifest");
+  t.resume(1);
+  EXPECT_EQ(t.send("chunk", "bc", 1).status, 204);
+  t.active = false;
+  EXPECT_EQ(t.send("deliver").status, 403);
+  t.active = true;
+  EXPECT_EQ(t.send("deliver").status, 204);
+  t.resume(3);
+  EXPECT_EQ(t.send("deliver").status, 204);
+  EXPECT_FALSE(fs::exists(a / L"part (3)"));
+  std::string value;
+  EXPECT_TRUE(std::ifstream(a / L"part") >> value);
+  EXPECT_EQ(value, "keep");
+  EXPECT_TRUE(std::ifstream(a / L"part (2)") >> value);
+  EXPECT_EQ(value, "abc");
+  EXPECT_TRUE(std::ifstream(b / L"part") >> value);
+  EXPECT_EQ(value, "abc");
+  EXPECT_EQ(fs::file_size(a / L"empty"), 0U);
+  EXPECT_EQ(fs::file_size(b / L"empty"), 0U);
+  EXPECT_EQ(fs::remove_all(t.root), 8U);
+}
+
+TEST(ClipboardResumeTest, CancelsOnlyTheAddressedPasteAndExpiresIdleFolderPins) {
+  resume_test_t t;
+  t.root += "-" + platf::new_file_lease();
+  ASSERT_TRUE(fs::create_directories(t.root));
+  t.task.assign(32, 'a');
+  ASSERT_EQ(t.capture(t.root), 204);
+  t.resume(0);
+  ASSERT_EQ(t.send("chunk", "ab").status, 204);
+  t.task.assign(32, 'b');
+  ASSERT_EQ(t.capture(t.root), 204);
+  t.resume(0);
+  ASSERT_EQ(t.send("chunk", "a").status, 204);
+  ++t.stream;
+  t.resume(1);
+  --t.stream;
+  EXPECT_EQ(t.send("discard").status, 403);
+  ++t.stream;
+  t.cert = "paired-b";
+  EXPECT_EQ(t.send("resume", resume_manifest).status, 404);
+  EXPECT_EQ(t.send("discard").status, 204);
+  t.cert = "paired-a";
+  ++t.logon.LowPart;
+  EXPECT_EQ(t.send("resume", resume_manifest).status, 404);
+  --t.logon.LowPart;
+  EXPECT_EQ(t.send("discard").status, 204);
+  EXPECT_EQ(t.send("resume", resume_manifest).status, 404);
+  t.task.assign(32, 'a');
+  t.resume(2);
+  for (char suffix = 'b'; suffix <= 'f'; ++suffix) {
+    t.task.assign(32, suffix);
+    ASSERT_EQ(t.capture(t.root), 204);
+  }
+  t.task.assign(32, '1');
+  ASSERT_EQ(t.capture(t.root), 204);
+  t.task.assign(32, '2');
+  ASSERT_EQ(t.capture(t.root), 204);
+  t.task.assign(32, '3');
+  EXPECT_EQ(t.capture(t.root), 429);
+  t.cache.expire(decltype(t.cache)::clock::now() + std::chrono::minutes(31));
+  EXPECT_EQ(t.send("resume", resume_manifest).status, 404);
+  EXPECT_TRUE(fs::is_empty(t.root));
+  EXPECT_TRUE(fs::remove(t.root));
+}
+
+TEST(ClipboardResumeTest, ReleasesUnsupportedRevokedAndCancelledTargetCaptures) {
+  resume_test_t t;
+  using target_t = platf::clipboard_upload::paste_target_t;
+  const auto capture = [&](const std::function<int(target_t &)> &resolve) {
+    return t.cache.capture_target(t.cert, t.logon, t.stream, t.task, decltype(t.cache)::clock::now(), [&] {
+                    return t.active;
+                  },
+                                  resolve)
+      .status;
+  };
+  auto unsupported = [](target_t &) {
+    return 204;
+  };
+  t.task = "invalid";
+  EXPECT_EQ(capture(unsupported), 400);
+  t.task.assign(32, 'f');
+  EXPECT_EQ(capture(unsupported), 422);
+  EXPECT_EQ(t.send("resume", resume_manifest).status, 404);
+  EXPECT_EQ(capture([&](target_t &) {
+              EXPECT_EQ(t.send("resume", resume_manifest).conflict, "busy");
+              EXPECT_EQ(capture(unsupported), 409);
+              EXPECT_EQ(t.send("discard").status, 204);
+              return 200;
+            }),
+            404);
+  EXPECT_EQ(capture([&](target_t &) {
+              t.active = false;
+              return 200;
+            }),
+            403);
+  t.active = true;
+  EXPECT_EQ(t.send("resume", resume_manifest).status, 404);
+}
+
+TEST(ClipboardResumeTest, ReconnectGestureReusesBytesOnlyAtTheSameCapturedDirectory) {
+  resume_test_t t;
+  t.root += "-" + platf::new_file_lease();
+  const auto a = t.root / L"a";
+  const auto b = t.root / L"b";
+  ASSERT_TRUE(fs::create_directories(a));
+  ASSERT_TRUE(fs::create_directories(b));
+  const std::string original(32, 'a');
+  t.task = original;
+  ASSERT_EQ(t.choose(a).task, original);
+  t.resume(0);
+  ASSERT_EQ(t.send("chunk", "ab").status, 204);
+
+  ++t.stream;
+  t.task.assign(32, 'b');
+  ASSERT_EQ(t.choose(b, original).task, t.task);
+  t.resume(0);
+  ASSERT_EQ(t.send("abort").status, 204);
+  t.task.assign(32, 'c');
+  ASSERT_EQ(t.choose(a, original).task, original);
+  ASSERT_EQ(t.choose(b, original).task, original);
+  t.task = original;
+  t.resume(2);
+  ASSERT_EQ(t.send("chunk", "c", 2).status, 204);
+  ASSERT_EQ(t.send("deliver").status, 204);
+
+  // A lost final acknowledgement is still recognized after releasing the directory pins.
+  ++t.stream;
+  t.task.assign(32, 'd');
+  ASSERT_EQ(t.choose(a, original).task, original);
+  t.task = original;
+  t.resume(3);
+  ASSERT_EQ(t.send("deliver").status, 204);
+  ASSERT_FALSE(fs::exists(a / L"part (2)"));
+  ASSERT_TRUE(fs::is_empty(b));
+  EXPECT_EQ(fs::remove_all(t.root), 5U);
+}
 
 TEST(ClipboardResumeTest, RebindsOnlyMatchingOwnerAndFileRevisionsAndDiscardsOnCancel) {
   resume_test_t t;

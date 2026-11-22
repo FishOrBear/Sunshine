@@ -42,6 +42,46 @@ namespace platf::file_transfer {
     }
   }
 
+  /** @brief Restrict access to mounted local volumes. */
+  inline bool local_volume(const fs::path &root) {
+    const auto chars = root.native();
+    if (chars.size() != 3 || chars[1] != L':' || chars[2] != L'\\' || !((chars[0] >= L'A' && chars[0] <= L'Z') || (chars[0] >= L'a' && chars[0] <= L'z'))) {
+      return false;
+    }
+    const auto type = GetDriveTypeW(chars.c_str());
+    return type == DRIVE_FIXED || type == DRIVE_REMOVABLE || type == DRIVE_RAMDISK;
+  }
+
+  /** @brief Hold each directory without delete sharing to prevent a concurrent junction swap. */
+  inline int pin_directory(const fs::path &dir, std::vector<file_handle> &pins) {
+    auto current = dir.root_path();
+    if (!local_volume(current)) {
+      return 400;
+    }
+    for (const auto &part : dir.relative_path()) {
+      if (part.empty()) {
+        continue;
+      }
+      if (!win_clipboard::detail::valid_name(part.native())) {
+        return 400;
+      }
+      current /= part;
+      HANDLE raw = CreateFileW(current.c_str(), FILE_TRAVERSE | FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+      if (raw == INVALID_HANDLE_VALUE) {
+        return file_error();
+      }
+      pins.emplace_back(raw);
+      BY_HANDLE_FILE_INFORMATION info {};
+      if (!GetFileInformationByHandle(raw, &info)) {
+        return file_error();
+      }
+      if (!(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+        return 403;
+      }
+    }
+    return 200;
+  }
+
   /** @brief Convert a Win32 UTC timestamp to milliseconds since the Unix epoch. */
   inline std::int64_t milliseconds(FILETIME value) {
     ULARGE_INTEGER stamp;
@@ -104,14 +144,14 @@ namespace platf::file_transfer {
     return SetFileInformationByHandle(file, FileDispositionInfo, &info, sizeof(info));
   }
 
-  /** @brief Publish a fully written file with an atomic no-replace rename. */
-  inline int publish_file(HANDLE file, const fs::path &path) {
+  /** @brief Move the pinned staging file to its final name without replacing an existing entry. */
+  inline int rename_staged_file(HANDLE file, const fs::path &path) {
     const auto &name = path.native();
     std::vector<unsigned char> data(sizeof(FILE_RENAME_INFO) + name.size() * sizeof(wchar_t));
     auto info = reinterpret_cast<FILE_RENAME_INFO *>(data.data());
     info->FileNameLength = static_cast<DWORD>(name.size() * sizeof(wchar_t));
     std::memcpy(info->FileName, name.data(), info->FileNameLength);
-    if (!FlushFileBuffers(file) || !disposition(file, false)) {
+    if (!disposition(file, false)) {
       return file_error();
     }
     if (SetFileInformationByHandle(file, FileRenameInfo, info, static_cast<DWORD>(data.size()))) {
@@ -122,14 +162,13 @@ namespace platf::file_transfer {
     return file_error(error);
   }
 
-  /** @brief Stage a file on its target volume with automatic cleanup on error or process exit. */
-  inline int create_staging(const fs::path &path, file_handle &file) {
-    if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
-      return 409;
-    }
-    if (GetLastError() != ERROR_FILE_NOT_FOUND) {
-      return file_error();
-    }
+  /** @brief Flush a standalone transfer before acknowledging its final rename. */
+  inline int publish_file(HANDLE file, const fs::path &path) {
+    return FlushFileBuffers(file) ? rename_staged_file(file, path) : file_error();
+  }
+
+  /** @brief Create a private, delete-pending staging file on the destination volume. */
+  inline int create_staging_in(const fs::path &directory, file_handle &file, DWORD attributes) {
     GUID guid {};
     if (FAILED(CoCreateGuid(&guid))) {
       return 500;
@@ -138,8 +177,8 @@ namespace platf::file_transfer {
     if (!StringFromGUID2(guid, guid_text, 40)) {
       return 500;
     }
-    const auto tmp = path.parent_path() / (std::wstring(L".sunshine-") + guid_text + L".part");
-    HANDLE raw = CreateFileW(tmp.c_str(), GENERIC_WRITE | FILE_READ_ATTRIBUTES | DELETE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    const auto tmp = directory / (std::wstring(L".sunshine-") + guid_text + L".part");
+    HANDLE raw = CreateFileW(tmp.c_str(), GENERIC_WRITE | FILE_READ_ATTRIBUTES | DELETE, 0, nullptr, CREATE_NEW, attributes, nullptr);
     if (raw == INVALID_HANDLE_VALUE) {
       return file_error();
     }
@@ -151,6 +190,17 @@ namespace platf::file_transfer {
       return file_error(error);
     }
     return 200;
+  }
+
+  /** @brief Stage a standalone transfer only when its final filename is available. */
+  inline int create_staging(const fs::path &path, file_handle &file) {
+    if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+      return 409;
+    }
+    if (GetLastError() != ERROR_FILE_NOT_FOUND) {
+      return file_error();
+    }
+    return create_staging_in(path.parent_path(), file, FILE_ATTRIBUTE_NORMAL);
   }
 
   /** @brief Pinned source, verified metadata and incremental digest across bounded requests. */
