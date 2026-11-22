@@ -40,6 +40,7 @@
 #ifdef _WIN32
   #include "platform/windows/clipboard.h"
   #include "platform/windows/file_sessions.h"
+  #include "platform/windows/host_power.h"
 #endif
 #include "process.h"
 #include "rtsp.h"
@@ -1304,7 +1305,7 @@ namespace nvhttp {
    * @param request HTTP request data from the client.
    */
   template<class T>
-  void serverinfo(std::shared_ptr<typename SimpleWeb::ServerBase<T>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<T>::Request> request, bool standalone_files = false) {
+  void serverinfo(std::shared_ptr<typename SimpleWeb::ServerBase<T>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<T>::Request> request, bool host_power = false, bool standalone_files = false) {
     print_req<T>(request);
 
     int pair_status = 0;
@@ -1336,6 +1337,9 @@ namespace nvhttp {
     if constexpr (std::is_same_v<SunshineHTTPS, T>) {
       if (standalone_files) {
         tree.put("root.standalonefileversion", 1);
+      }
+      if (host_power) {
+        tree.put("root.hostpowerversion", 1);
       }
       tree.put("root.mac", platf::get_mac_address(net::addr_to_normalized_string(local_endpoint.address())));
     } else {
@@ -1748,6 +1752,42 @@ namespace nvhttp {
     return cert && is_client_enabled(cert.get());
   }
 
+  /** @brief Check host consent and active pairing for a power request. */
+  bool may_control_host_power(const std::string &pem) {
+    return config::nvhttp.host_power && paired_client_enabled(pem);
+  }
+
+  /** @brief Accept a fixed Windows power action and dispatch it after the HTTP reply is flushed. */
+  void handle_host_power(resp_https_t response, req_https_t request, const std::string &cert) {
+    using status = SimpleWeb::StatusCode;
+    const auto authorized = [cert]() {
+      return may_control_host_power(cert);
+    };
+    if (!authorized()) {
+      response->write(status::client_error_forbidden);
+      return;
+    }
+    const auto header = request->header.find("X-Moonlight-Host-Power");
+    const auto args = request->parse_query_string();
+    const auto restart = host_power::restart_requested(get_arg(args, "action", ""));
+    if (header == request->header.end() || header->second != "1" || request->content.size() != 0 || args.count("action") != 1 || !restart.has_value()) {
+      response->write(status::client_error_bad_request);
+      return;
+    }
+
+    static host_power::queue_t queue;
+    auto [code, after_send] = queue.prepare([&]() {
+      return host_power::prepare_windows_action(*restart);
+    },
+                                            authorized);
+    response->write(static_cast<status>(code), SimpleWeb::CaseInsensitiveMultimap {{"Cache-Control", "no-store"}});
+    if (after_send) {
+      response->send([after_send = std::move(after_send)](const SimpleWeb::error_code &ec) {
+        after_send(!ec);
+      });
+    }
+  }
+
   /** @brief Authenticate a file-only connection and bind its staging state to the verified certificate. */
   int change_file_session(const std::string &cert, const std::string &token, bool close) {
     if (!clipboard::valid_token(token)) {
@@ -2101,13 +2141,15 @@ namespace nvhttp {
 
     https_server.default_resource["GET"] = not_found<SunshineHTTPS>;
     https_server.resource["^/serverinfo$"]["GET"] = [&](auto resp, auto req) {
+      bool power_enabled = false;
       bool standalone_files = false;
 #ifdef _WIN32
-      if (config::nvhttp.file_browser && paired_client_enabled(https_server.client_identity(*req).first)) {
+      if ((config::nvhttp.host_power || config::nvhttp.file_browser) && paired_client_enabled(https_server.client_identity(*req).first)) {
+        power_enabled = config::nvhttp.host_power;
         standalone_files = config::nvhttp.file_browser;
       }
 #endif
-      serverinfo<SunshineHTTPS>(resp, req, standalone_files);
+      serverinfo<SunshineHTTPS>(resp, req, power_enabled, standalone_files);
     };
     https_server.resource["^/pair$"]["GET"] = [](auto resp, auto req) {
       pair<SunshineHTTPS>(resp, req);
@@ -2123,6 +2165,9 @@ namespace nvhttp {
     https_server.resource["^/cancel$"]["GET"] = cancel;
 
 #ifdef _WIN32
+    https_server.resource["^/hostpower$"]["POST"] = [&](auto resp, auto req) {
+      handle_host_power(resp, req, https_server.client_identity(*req).first);
+    };
     https_server.resource["^/files/session$"]["POST"] = [&](auto resp, auto req) {
       handle_file_session(resp, req, https_server.client_identity(*req).first, false);
     };
@@ -2313,6 +2358,9 @@ namespace nvhttp {
       return static_cast<bool>(file_session(cert, token));
     }
 
+    bool client_may_control_host_power(const std::string &cert) {
+      return may_control_host_power(cert);
+    }
   #endif
 
     void reset_client_state() {
