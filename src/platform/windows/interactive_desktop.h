@@ -12,6 +12,8 @@ namespace platf::desktop {
   struct shell_impersonation_t {
     HANDLE token {};  ///< Token of the interactive shell.
     bool active {};  ///< Whether to restore the original identity.
+    HDESK original_desktop {};  ///< Borrowed thread desktop to restore after the request.
+    HDESK shell_desktop {};  ///< Owned handle while temporarily attached to the shell desktop.
 
     ~shell_impersonation_t() {
       if (active && !RevertToSelf()) {
@@ -20,10 +22,33 @@ namespace platf::desktop {
       if (token) {
         CloseHandle(token);
       }
+      if (shell_desktop) {
+        if (original_desktop && !SetThreadDesktop(original_desktop)) {
+          std::terminate();
+        }
+        CloseDesktop(shell_desktop);
+      }
     }
 
     /** @brief Impersonate the interactive shell, including when Sunshine runs as SYSTEM. */
     bool begin() {
+      // Encoder probing can attach the startup thread to Winlogon while the PC
+      // is locked. HTTP workers inherit that desktop, which has no shell even
+      // after the user unlocks the PC. Bind this request to Default explicitly;
+      // on_user_desktop() still rejects access while the input desktop is secure.
+      wchar_t name[64] {};
+      DWORD needed {};
+      const auto current = GetThreadDesktop(GetCurrentThreadId());
+      if (!GetUserObjectInformationW(current, UOI_NAME, name, sizeof(name), &needed)) {
+        return false;
+      }
+      if (CompareStringOrdinal(name, -1, L"Default", -1, TRUE) != CSTR_EQUAL) {
+        shell_desktop = OpenDesktopW(L"Default", 0, FALSE, GENERIC_ALL);
+        if (!shell_desktop || !SetThreadDesktop(shell_desktop)) {
+          return false;
+        }
+        original_desktop = current;
+      }
       DWORD pid {};
       if (!GetWindowThreadProcessId(GetShellWindow(), &pid)) {
         return false;

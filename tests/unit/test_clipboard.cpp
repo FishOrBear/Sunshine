@@ -20,6 +20,7 @@
   #include "src/platform/windows/clipboard_upload.h"
   #include "src/platform/windows/clipboard_win32.h"
   #include "src/platform/windows/file_sessions.h"
+  #include "src/platform/windows/interactive_desktop.h"
 
 #endif
 
@@ -76,6 +77,85 @@ TEST(ClipboardGrantTest, DisclosesOnlyNewCopiesAfterSessionStartup) {
 }
 
 #ifdef _WIN32
+TEST(ClipboardDesktopTest, RestoresInheritedDesktopAfterShellAccess) {
+  if (!GetShellWindow()) {
+    GTEST_SKIP() << "Requires an interactive Windows shell";
+  }
+  const auto name = L"SunshineClipboardTest-" + std::to_wstring(GetCurrentProcessId());
+  const auto isolated = CreateDesktopW(name.c_str(), nullptr, nullptr, 0, GENERIC_ALL, nullptr);
+  ASSERT_NE(isolated, nullptr);
+  std::thread worker([&] {
+    const auto original = GetThreadDesktop(GetCurrentThreadId());
+    if (!SetThreadDesktop(isolated)) {
+      ADD_FAILURE() << "Cannot attach test worker to isolated desktop";
+      return;
+    }
+    EXPECT_EQ(GetShellWindow(), nullptr);
+    {
+      platf::desktop::shell_impersonation_t user;
+      EXPECT_TRUE(user.begin());
+      EXPECT_NE(GetShellWindow(), nullptr);
+      EXPECT_NE(user.token, nullptr);
+    }
+    EXPECT_EQ(GetThreadDesktop(GetCurrentThreadId()), isolated);
+    EXPECT_EQ(GetShellWindow(), nullptr);
+    HANDLE token {};
+    EXPECT_FALSE(OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &token));
+    EXPECT_EQ(GetLastError(), ERROR_NO_TOKEN);
+    if (token) {
+      CloseHandle(token);
+    }
+    EXPECT_TRUE(SetThreadDesktop(original));
+  });
+  worker.join();
+  EXPECT_TRUE(CloseDesktop(isolated));
+}
+
+TEST(ClipboardDesktopTest, KeepsExistingShellDesktop) {
+  if (!GetShellWindow()) {
+    GTEST_SKIP() << "Requires an interactive Windows shell";
+  }
+  std::thread worker([] {
+    const auto original = GetThreadDesktop(GetCurrentThreadId());
+    {
+      platf::desktop::shell_impersonation_t user;
+      EXPECT_TRUE(user.begin());
+      EXPECT_EQ(user.shell_desktop, nullptr);
+      EXPECT_EQ(GetThreadDesktop(GetCurrentThreadId()), original);
+    }
+    EXPECT_EQ(GetThreadDesktop(GetCurrentThreadId()), original);
+  });
+  worker.join();
+}
+
+TEST(ClipboardDesktopTest, RefusesDesktopSwitchWhenThreadOwnsAWindow) {
+  const auto name = L"SunshineClipboardBusyTest-" + std::to_wstring(GetCurrentProcessId());
+  const auto isolated = CreateDesktopW(name.c_str(), nullptr, nullptr, 0, GENERIC_ALL, nullptr);
+  ASSERT_NE(isolated, nullptr);
+  std::thread worker([&] {
+    const auto original = GetThreadDesktop(GetCurrentThreadId());
+    if (!SetThreadDesktop(isolated)) {
+      ADD_FAILURE() << "Cannot attach test worker to isolated desktop";
+      return;
+    }
+    const auto window = CreateWindowW(L"STATIC", L"", 0, 0, 0, 0, 0, nullptr, nullptr, nullptr, nullptr);
+    EXPECT_NE(window, nullptr);
+    if (window) {
+      {
+        platf::desktop::shell_impersonation_t user;
+        EXPECT_FALSE(user.begin());
+        EXPECT_FALSE(user.active);
+        EXPECT_EQ(user.token, nullptr);
+        EXPECT_EQ(GetThreadDesktop(GetCurrentThreadId()), isolated);
+      }
+      EXPECT_TRUE(DestroyWindow(window));
+    }
+    EXPECT_TRUE(SetThreadDesktop(original));
+  });
+  worker.join();
+  EXPECT_TRUE(CloseDesktop(isolated));
+}
+
 TEST(ClipboardGrantTest, FirstPollPreservesCopyMadeAfterStreamStartup) {
   const std::uint32_t current = platf::clipboard_sequence();
   const clipboard::formats_t formats {true, false, current - 1};
