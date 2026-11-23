@@ -28,6 +28,8 @@
 // lib includes
 #include <rs.h>
 #ifdef _WIN32
+  #include "platform/windows/clipboard.h"
+
   #include <libvirtualhid/license.hpp>
 #endif
 
@@ -179,6 +181,11 @@ void mainThreadLoop(const std::shared_ptr<safe::event_t<bool>> &shutdown_event) 
  * @return Process or platform callback exit code.
  */
 int main(int argc, char *argv[]) {
+#ifdef _WIN32
+  if (argc == 3 && std::string_view(argv[1]) == "--clipboard-file-selection") {
+    return platf::export_clipboard_paths(argv[2]);
+  }
+#endif
 #ifdef __linux__
   const bool privileged_execution = getauxval(AT_SECURE) != 0 || platf::has_elevated_privileges(true);
   if (privileged_execution && !platf::sanitize_process_environment()) {

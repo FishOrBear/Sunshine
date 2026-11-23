@@ -32,6 +32,7 @@ namespace {
     std::uint64_t session = 1;
     std::optional<std::uint64_t> ack;
     bool active = true;
+    std::string replace;
 
     transfer_test_t() {
       fs::create_directory(directory);
@@ -50,7 +51,8 @@ namespace {
       std::vector<files::file_handle> pins;
       const int status = store.exchange(op, cert, logon, session, destination, bind ? task : lease, sha, offset, size, bytes, pins, output, ack, [&] {
         return active;
-      });
+      },
+                                        op == "resume" || op == "commit" ? replace : "");
       if (op == "resume" && status == 200) {
         lease = nlohmann::json::parse(output)["id"].get<std::string>();
       }
@@ -141,6 +143,35 @@ TEST(StandaloneFileTransferTest, PublishesZeroBytesAndPreservesExistingDestinati
   EXPECT_EQ(contents, "original");
   t.destination = t.directory / "large";
   ASSERT_EQ(t.call("resume", 0, {}, abc_sha, 1ULL << 36), 200);
+}
+
+TEST(StandaloneFileTransferTest, ReplacesOnlyTheSelectedVersionAtCommitAndResumesItsReceipt) {
+  transfer_test_t t;
+  ASSERT_TRUE(std::ofstream(t.destination) << "original");
+  t.replace = files::replacement_version(t.destination);
+  ASSERT_FALSE(t.replace.empty());
+  ASSERT_EQ(t.call("resume"), 200);
+  ASSERT_EQ(t.call("chunk", 0, "ab"), 204);
+  EXPECT_EQ(fs::file_size(t.destination), 8);
+  ++t.session;
+  ASSERT_EQ(t.call("resume"), 200);
+  ASSERT_EQ(t.call("chunk", 2, "c"), 204);
+  const auto version = std::exchange(t.replace, "");
+  EXPECT_EQ(t.call("commit"), 409);
+  t.replace = version;
+  ASSERT_TRUE(std::ofstream(t.destination) << "edited");
+  EXPECT_EQ(t.call("commit"), 409);
+  EXPECT_EQ(fs::file_size(t.destination), 6);
+  EXPECT_EQ(t.call("resume"), 409);
+  t.replace = files::replacement_version(t.destination);
+  ASSERT_EQ(t.call("resume"), 200);
+  ASSERT_EQ(t.call("chunk", 0, "abc"), 204);
+  ASSERT_EQ(t.call("commit"), 204);
+  ASSERT_EQ(t.call("resume"), 200);
+  EXPECT_EQ(nlohmann::json::parse(t.output)["complete"], true);
+  std::string content;
+  std::ifstream(t.destination) >> content;
+  EXPECT_EQ(content, "abc");
 }
 
 TEST(StandaloneFileTransferTest, PollsContentHashAndDetectsChangesWithIdenticalSizeAndTimestamp) {

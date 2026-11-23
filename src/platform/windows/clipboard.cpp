@@ -6,14 +6,74 @@
 
 #include "clipboard_download.h"
 #include "clipboard_resume.h"
+#include "clipboard_selection.h"
 #include "clipboard_upload.h"
 #include "clipboard_win32.h"
 #include "interactive_desktop.h"
+#include "shellfiledrop.h"
 
 #include <atomic>
 #include <mutex>
 
 namespace platf {
+  int export_clipboard_paths(const char *argument) {
+    uintptr_t handle {};
+    const auto end = argument + std::strlen(argument);
+    auto parsed = std::from_chars(argument, end, handle);
+    if (parsed.ec != std::errc {} || parsed.ptr != end || !desktop::on_user_desktop()) {
+      return 409;
+    }
+    selection::view_t view(static_cast<selection::packet *>(MapViewOfFile(reinterpret_cast<HANDLE>(handle), FILE_MAP_WRITE, 0, 0, sizeof(selection::packet))));
+    if (!view) {
+      return 500;
+    }
+    if (view->operation != selection::operation_t::clipboard) {
+      if (view->operation != selection::operation_t::drag_source && view->operation != selection::operation_t::drop_target) {
+        return 400;
+      }
+      const auto paths = shell_file_drop::paths_at(view->point, view->operation == selection::operation_t::drag_source);
+      if (paths.empty()) {
+        return 204;
+      }
+      auto *pos = view->paths;
+      const auto end = pos + std::size(view->paths);
+      for (const auto &path : paths) {
+        if (path.size() > 32767 || size_t(end - pos) <= path.size()) {
+          return 413;
+        }
+        pos = std::copy(path.begin(), path.end(), pos);
+        *pos++ = L'\0';
+      }
+      view->count = static_cast<DWORD>(paths.size());
+      return desktop::on_user_desktop() ? 200 : 409;
+    }
+    win_clipboard::detail::clipboard_lock lock(nullptr);
+    if (!lock.opened || GetClipboardSequenceNumber() != view->revision) {
+      return 409;
+    }
+    if (!IsClipboardFormatAvailable(CF_HDROP)) {
+      return 204;
+    }
+    auto drop = static_cast<HDROP>(GetClipboardData(CF_HDROP));
+    if (!drop) {
+      return 409;
+    }
+    const auto count = DragQueryFileW(drop, 0xffffffff, nullptr, 0);
+    if (count > win_clipboard::max_files) {
+      return 413;
+    }
+    const auto paths = win_clipboard::detail::file_paths(drop, count);
+    if (paths.empty()) {
+      return 204;
+    }
+    auto pos = view->paths;
+    for (const auto &path : paths) {
+      pos = std::copy(path.native().begin(), path.native().end(), pos);
+      *pos++ = L'\0';
+    }
+    view->count = count;
+    return GetClipboardSequenceNumber() == view->revision ? 200 : 409;
+  }
 
   /** @brief Pending and most recently committed batches belong only to this stream. */
   struct clipboard_upload_session_t: std::enable_shared_from_this<clipboard_upload_session_t> {
@@ -191,6 +251,12 @@ namespace platf {
     return {status};
   }
 
+  int read_pinned_transfer(clipboard_upload_session_t &session, const clipboard_download_request_t &request, std::uint32_t revision, std::string &output) {
+    auto &snapshot = session.download;
+    std::lock_guard lock(snapshot.mutex);
+    return snapshot.read(request, revision, std::nullopt, snapshot.logon, output);
+  }
+
   std::uint32_t clipboard_sequence() {
     return GetClipboardSequenceNumber();
   }
@@ -218,11 +284,35 @@ namespace platf {
         return 403;
       }
       auto &snapshot = formats.upload_session->download;
+      if (download.op == "offer") {
+        if (!download.offer_source || download.offer_source == formats.upload_session) {
+          return 403;
+        }
+        const auto &source = download.offer_source->download;
+        std::scoped_lock locks(download.offer_source->download.mutex, snapshot.mutex);
+        sequence = *since;
+        return source.reopen(download.lease, *since, stats.AuthenticationId, snapshot, output);
+      }
       std::lock_guard lock(snapshot.mutex);
       if (download.op != "1") {
         return snapshot.read(download, *since, GetClipboardSequenceNumber(), stats.AuthenticationId, output);
       }
-      auto status = snapshot.begin(*since, formats.initial_sequence, current, stats.AuthenticationId, output);
+      auto status = snapshot.begin(*since, formats.initial_sequence, current, stats.AuthenticationId, output, download.metadata_only);
+      // On some Windows desktops SYSTEM sees the revision but no formats,
+      // even while impersonating Explorer. Query that revision in the shell
+      // user's process context. File handles are still opened under impersonation.
+      if (!status && CountClipboardFormats() == 0) {
+        std::vector<std::filesystem::path> paths;
+        const auto read = selection::read_as_user(user.token, current, paths);
+        if (read == 200) {
+          if (!desktop::on_user_desktop() || (grant_active && !grant_active()) || current != GetClipboardSequenceNumber()) {
+            return 409;
+          }
+          status = snapshot.pin(paths, current, stats.AuthenticationId, output, download.metadata_only);
+        } else if (read != 204) {
+          status = read;
+        }
+      }
       sequence = current;
       if (status) {
         return *status;

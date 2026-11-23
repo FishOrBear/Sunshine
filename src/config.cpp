@@ -839,6 +839,7 @@ namespace config {
     false,  // clipboard_text
     true,  // host_power
     true,  // file_browser
+    true,  // file_browser_delete
     false,  // clipboard_files
     false,  // clipboard_images
   };
@@ -1807,6 +1808,7 @@ namespace config {
     bool_f(vars, "clipboard_files", nvhttp.clipboard_files);
     bool_f(vars, "clipboard_images", nvhttp.clipboard_images);
     bool_f(vars, "file_browser", nvhttp.file_browser);
+    bool_f(vars, "file_browser_delete", nvhttp.file_browser_delete);
     bool_f(vars, "host_power", nvhttp.host_power);
     string_f(vars, "sunshine_name", nvhttp.sunshine_name);
     path_f(vars, "log_path", config::sunshine.log_file);

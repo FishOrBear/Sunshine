@@ -12,14 +12,16 @@
 
 namespace file_sessions {
   /** @brief Keep pairing identities and random client tokens bound to their own staging files. */
-  class registry_t {
+  template<class Session>
+  class basic_registry_t {
   public:
     using clock = std::chrono::steady_clock;  ///< Monotonic idle timer.
-    using session_ptr = std::shared_ptr<platf::file_browser_session_t>;  ///< Open file operations and incomplete uploads.
+    using session_ptr = std::shared_ptr<Session>;  ///< Open file operations and incomplete uploads.
     static constexpr auto idle_timeout = std::chrono::minutes(30);  ///< Extend on open or authenticated use.
 
     /** @brief Open or renew a validated grant for an enabled pairing. */
-    int open(const std::string &cert, const std::string &token, clock::time_point now = clock::now()) {
+    template<class Factory>
+    int insert(const std::string &cert, const std::string &token, Factory create, bool renew, clock::time_point now = clock::now()) {
       if (cert.empty() || !clipboard::valid_token(token)) {
         return 400;
       }
@@ -27,6 +29,9 @@ namespace file_sessions {
       expire_locked(now);
       const auto key = std::make_pair(cert, token);
       if (auto found = sessions.find(key); found != sessions.end()) {
+        if (!renew) {
+          return 409;
+        }
         found->second.expires = now + idle_timeout;
         return 204;
       }
@@ -35,7 +40,7 @@ namespace file_sessions {
                                    }) >= 4) {
         return 429;
       }
-      sessions.emplace(key, grant_t {now + idle_timeout, platf::make_file_browser_session()});
+      sessions.emplace(key, grant_t {now + idle_timeout, create()});
       return 204;
     }
 
@@ -89,5 +94,12 @@ namespace file_sessions {
 
     std::mutex mutex;  ///< Serialize open, close and expiry across HTTPS requests.
     std::map<std::pair<std::string, std::string>, grant_t> sessions;  ///< Grants keyed by certificate and nonce.
+  };
+
+  class registry_t: public basic_registry_t<platf::file_browser_session_t> {
+  public:
+    int open(const std::string &cert, const std::string &token, clock::time_point now = clock::now()) {
+      return insert(cert, token, platf::make_file_browser_session, true, now);
+    }
   };
 }  // namespace file_sessions

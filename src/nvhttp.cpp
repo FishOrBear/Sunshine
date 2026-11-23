@@ -504,6 +504,7 @@ namespace nvhttp {
   void advertise_clipboard(pt::ptree &tree, const clipboard::grant_t &grant) {
     if (grant.formats.browser) {
       tree.put("root.filebrowserversion", 1);
+      tree.put("root.filedragversion", 1);
     }
     if (grant.formats.matches_any()) {
       tree.put("root.clipboardversion", 1);
@@ -1746,6 +1747,11 @@ namespace nvhttp {
     return registry;
   }
 
+  auto &clipboard_transfers() {
+    static file_sessions::basic_registry_t<platf::clipboard_upload_session_t> registry;
+    return registry;
+  }
+
   /** @brief Revalidate the verified TLS peer against the current pairing database. */
   bool paired_client_enabled(const std::string &pem) {
     if (pem.empty()) {
@@ -1841,11 +1847,12 @@ namespace nvhttp {
       response->write(status::client_error_forbidden);
       return;
     }
-    const auto active = [&]() {
-      return file_session(cert, token->second) == session;
-    };
     const auto op = request->path.substr(7);
     const auto args = request->parse_query_string();
+    const auto replace = get_arg(args, "replace", "");
+    const auto active = [&]() {
+      return ((op != "delete" && replace.empty()) || config::nvhttp.file_browser_delete) && file_session(cert, token->second) == session;
+    };
     const auto parse = [](const std::string &arg, auto &out) {
       const auto end = arg.data() + arg.size();
       const auto parsed = std::from_chars(arg.data(), end, out);
@@ -1854,8 +1861,16 @@ namespace nvhttp {
     std::uint64_t offset {}, size {};
     std::optional<std::int64_t> modified;
     const auto timestamp = get_arg(args, "modified", "");
+    std::optional<std::pair<unsigned, unsigned>> drag_point;
+    if (op == "drag-source" || op == "drop-target") {
+      auto &[x, y] = drag_point.emplace();
+      if (args.count("x") != 1 || args.count("y") != 1 || !parse(get_arg(args, "x", ""), x) || !parse(get_arg(args, "y", ""), y) || x > 65535 || y > 65535) {
+        response->write(status::client_error_bad_request);
+        return;
+      }
+    }
     const bool chunk = op == "write" || op == "read" || op == "chunk";
-    if ((chunk && !parse(get_arg(args, "offset", ""), offset)) || ((chunk || op == "resume" || op == "identity") && !parse(get_arg(args, "size", ""), size))) {
+    if ((chunk && !parse(get_arg(args, "offset", ""), offset)) || ((chunk || op == "resume" || op == "identity" || op == "delete") && !parse(get_arg(args, "size", ""), size))) {
       response->write(status::client_error_bad_request);
       return;
     }
@@ -1870,7 +1885,7 @@ namespace nvhttp {
     try {
       std::string payload;
       std::optional<std::uint64_t> ack;
-      const auto result = platf::exchange_files(*session, op, get_arg(args, "path", ""), get_arg(args, "id", ""), offset, size, modified, request->content.string(), payload, active, cert, get_arg(args, "sha256", ""), &ack);
+      const auto result = platf::exchange_files(*session, op, get_arg(args, "path", ""), get_arg(args, "id", ""), offset, size, modified, request->content.string(), payload, active, cert, get_arg(args, "sha256", ""), &ack, config::nvhttp.file_browser_delete, drag_point, replace, get_arg(args, "name", ""));
       if ((result == 200 || result == 202) && !active()) {
         response->write(status::client_error_forbidden);
         return;
@@ -1973,6 +1988,39 @@ namespace nvhttp {
     }
   }
 
+  // This endpoint only accepts indexed reads of one previously selected batch.
+  void handle_pinned_transfer(resp_https_t response, req_https_t request, const std::string &cert) {
+    using status = SimpleWeb::StatusCode;
+    const auto token = request->header.find("X-Clipboard-Token");
+    if (!config::nvhttp.clipboard_files || !paired_client_enabled(cert) || token == request->header.end() || request->header.count("X-Clipboard-Token") != 1 || !clipboard::valid_token(token->second)) {
+      response->write(status::client_error_forbidden);
+      return;
+    }
+    const auto args = request->parse_query_string();
+    platf::clipboard_download_request_t download;
+    download.op = get_arg(args, "download", "");
+    std::uint32_t revision {};
+    if (request->content.size() || !parse_clipboard_number(get_arg(args, "since", ""), revision) || !parse_clipboard_number(get_arg(args, "lease", ""), download.lease) || (download.op != "finish" && (download.op != "chunk" || !parse_clipboard_number(get_arg(args, "file", ""), download.file) || !parse_clipboard_number(get_arg(args, "offset", ""), download.offset)))) {
+      response->write(status::client_error_bad_request);
+      return;
+    }
+    const auto session = clipboard_transfers().find(cert, token->second);
+    if (!session) {
+      response->write(status::client_error_forbidden);
+      return;
+    }
+    std::string payload;
+    auto result = platf::read_pinned_transfer(*session, download, revision, payload);
+    if (result == 204 && download.op == "finish") {
+      clipboard_transfers().close(cert, token->second);
+    }
+    if (result == 200 && (!config::nvhttp.clipboard_files || !paired_client_enabled(cert) || clipboard_transfers().find(cert, token->second) != session)) {
+      response->write(status::client_error_forbidden);
+      return;
+    }
+    response->write(static_cast<status>(result), payload, SimpleWeb::CaseInsensitiveMultimap {{"Cache-Control", "no-store"}, {"Content-Type", "application/octet-stream"}, {"X-Clipboard-Sequence", std::to_string(revision)}});
+  }
+
   /** @brief Exchange clipboard contents over the authenticated connection of a running stream. */
   void handle_clipboard(resp_https_t response, req_https_t request, const std::string &cert) {
     using status = SimpleWeb::StatusCode;
@@ -2028,12 +2076,30 @@ namespace nvhttp {
         response->write(status::client_error_forbidden);
         return;
       }
-      if (download.op != "1" && ((!since || (download.op != "chunk" && download.op != "finish")) || !parse_clipboard_number(get_arg(args, "lease", ""), download.lease) || (download.op == "chunk" && (!parse_clipboard_number(get_arg(args, "file", ""), download.file) || !parse_clipboard_number(get_arg(args, "offset", ""), download.offset))))) {
+      if (download.op != "1" && ((!since || (download.op != "chunk" && download.op != "finish" && download.op != "offer")) || !parse_clipboard_number(get_arg(args, "lease", ""), download.lease) || (download.op == "chunk" && (!parse_clipboard_number(get_arg(args, "file", ""), download.file) || !parse_clipboard_number(get_arg(args, "offset", ""), download.offset))))) {
         response->write(status::client_error_bad_request);
         return;
       }
     }
 
+    const bool independent = request->header.count("X-Clipboard-Independent") == 1 &&
+                             request->header.find("X-Clipboard-Independent")->second == "1";
+    download.metadata_only = !independent && download.op == "1" && get_arg(args, "metadataOnly", "") == "1";
+    if (download.op == "offer" && !independent) {
+      response->write(status::client_error_bad_request);
+      return;
+    }
+    if (independent) {
+      if ((download.op != "1" && download.op != "offer") || !config::nvhttp.clipboard_files || !allowed.files || !since) {
+        response->write(status::client_error_forbidden);
+        return;
+      }
+      if (download.op == "offer") {
+        download.offer_source = allowed.upload_session;
+      }
+      allowed.images = allowed.text = false;
+      allowed.upload_session = platf::make_clipboard_upload_session(cert);
+    }
     std::string payload;
     std::uint32_t sequence {};
     try {
@@ -2047,6 +2113,23 @@ namespace nvhttp {
         return;
       }
       SimpleWeb::CaseInsensitiveMultimap headers {{"Cache-Control", "no-store"}, {"X-Clipboard-Sequence", std::to_string(sequence)}};
+      if (independent && result == 200 && payload.starts_with("M")) {
+        const auto task = crypto::rand_alphabet(64, "0123456789abcdef"sv);
+        std::lock_guard lock {client_auth_mutex()};
+        if (!is_client_enabled(crypto::x509(cert).get())) {
+          response->write(status::client_error_forbidden);
+          return;
+        }
+        const auto inserted = clipboard_transfers().insert(cert, task, [&] {
+          return allowed.upload_session;
+        },
+                                                           false);
+        if (inserted != 204) {
+          response->write(static_cast<status>(inserted));
+          return;
+        }
+        headers.emplace("X-Clipboard-Task", task);
+      }
       if (result == 200) {
         headers.emplace("Content-Type", "application/octet-stream");
         response->write(status::success_ok, payload, headers);
@@ -2196,14 +2279,18 @@ namespace nvhttp {
     https_server.resource["^/files/session/end$"]["POST"] = [&](auto resp, auto req) {
       handle_file_session(resp, req, https_server.client_identity(*req).first, true);
     };
-    for (const auto *op : {"list", "places", "read", "write", "abort", "mkdir", "capabilities", "identity", "resume", "chunk", "commit", "discard"}) {
-      const auto method = std::string_view(op) == "list" || std::string_view(op) == "places" || std::string_view(op) == "read" || std::string_view(op) == "capabilities" || std::string_view(op) == "identity" ? "GET" : "POST";
+    for (const auto *op : {"list", "places", "read", "write", "abort", "mkdir", "delete", "capabilities", "identity", "resume", "chunk", "commit", "discard", "drag-source", "drop-target"}) {
+      const std::string_view operation(op);
+      const auto method = operation == "list" || operation == "places" || operation == "read" || operation == "capabilities" || operation == "identity" || operation == "drag-source" || operation == "drop-target" ? "GET" : "POST";
       https_server.resource["^/files/"s + op + "$"][method] = [&](auto resp, auto req) {
         handle_files(resp, req, https_server.client_identity(*req).first);
       };
     }
     // Bound the TLS server's buffering before the request reaches a clipboard handler.
     https_server.config.max_request_streambuf_size = clipboard::max_image_packet + 64 * 1024;
+    https_server.resource["^/clipboard/transfer$"]["GET"] = [&](auto resp, auto req) {
+      handle_pinned_transfer(resp, req, https_server.client_identity(*req).first);
+    };
     https_server.resource["^/clipboard/batch$"]["POST"] = [&](auto resp, auto req) {
       handle_clipboard_batch(resp, req, https_server.client_identity(*req).first);
     };
@@ -2252,6 +2339,7 @@ namespace nvhttp {
 #ifdef _WIN32
     while (!shutdown_event->view(std::chrono::minutes(1))) {
       standalone_sessions().expire();
+      clipboard_transfers().expire();
       platf::expire_clipboard_uploads();
       platf::expire_file_transfers();
     }
@@ -2266,6 +2354,7 @@ namespace nvhttp {
     tcp.join();
 #ifdef _WIN32
     standalone_sessions().revoke();
+    clipboard_transfers().revoke();
 #endif
   }
 
@@ -2273,6 +2362,7 @@ namespace nvhttp {
     std::lock_guard lock {client_auth_mutex()};
 #ifdef _WIN32
     standalone_sessions().revoke();
+    clipboard_transfers().revoke();
 #endif
     client_root = {};
     cert_chain.clear();
@@ -2286,6 +2376,7 @@ namespace nvhttp {
       if ((*it).uuid == uuid) {
 #ifdef _WIN32
         standalone_sessions().revoke(it->cert);
+        clipboard_transfers().revoke(it->cert);
 #endif
         it = client_root.named_devices.erase(it);
         removed = true;
@@ -2306,6 +2397,7 @@ namespace nvhttp {
 #ifdef _WIN32
         if (!enabled) {
           standalone_sessions().revoke(named_cert.cert);
+          clipboard_transfers().revoke(named_cert.cert);
         }
 #endif
         named_cert.enabled = enabled;

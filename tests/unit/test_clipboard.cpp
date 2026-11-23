@@ -19,8 +19,10 @@
   #include "src/platform/windows/clipboard_resume.h"
   #include "src/platform/windows/clipboard_upload.h"
   #include "src/platform/windows/clipboard_win32.h"
+  #include "src/platform/windows/file_drag.h"
   #include "src/platform/windows/file_sessions.h"
   #include "src/platform/windows/interactive_desktop.h"
+  #include "src/utility.h"
 
 #endif
 
@@ -254,6 +256,28 @@ TEST(FileSessionTest, BindRenewExpireAndCloseWithoutStreaming) {
   EXPECT_FALSE(sessions.find("a", token, now + timeout * 2));
 }
 
+TEST(FileSessionTest, IndependentClipboardTaskSurvivesStreamAndCannotBeReplaced) {
+  file_sessions::basic_registry_t<int> tasks;
+  auto stream = std::make_shared<int>(42);
+  const std::string task(64, 'd');
+  ASSERT_EQ(tasks.insert("peer", task, [&] {
+    return stream;
+  },
+                         false),
+            204);
+  stream.reset();
+  EXPECT_FALSE(tasks.find("other peer", task));
+  EXPECT_EQ(tasks.insert("peer", task, [] {
+    return std::make_shared<int>(0);
+  },
+                         false),
+            409);
+  ASSERT_TRUE(tasks.find("peer", task));
+  EXPECT_EQ(*tasks.find("peer", task), 42);
+  tasks.revoke("peer");
+  EXPECT_FALSE(tasks.find("peer", task));
+}
+
 TEST(FileSessionTest, LimitsEachPairingAndTotalWithoutEvictingAnActiveTransfer) {
   file_sessions::registry_t sessions;
   for (int i = 0; i < 8; ++i) {
@@ -285,6 +309,75 @@ TEST(FileBrowserTest, RequiresValidCapabilityAndWriteBounds) {
   EXPECT_EQ(platf::exchange_files(*session, "read", "", "", 0, UINT64_MAX, {}, {}, out, denied), 400);
 }
 
+TEST(FileDragTest, UsesTheCapturedMonitorAndRejectsLetterboxBars) {
+  const platf::file_drag::display_t display {1920, 50, 1600, 1200, 1920, 1080};
+  const POINT origin {-1920, -100};
+  EXPECT_FALSE(display.point(0, 100, origin));
+  EXPECT_FALSE(display.point(65535, 400, origin));
+  EXPECT_FALSE(display.point(32768, 65536, origin));
+  EXPECT_FALSE(platf::file_drag::display_t {}.point(0, 0, origin));
+  const auto center = display.point(32768, 32768, origin);
+  ASSERT_TRUE(center);
+  EXPECT_EQ(center->x, 800);
+  EXPECT_EQ(center->y, 550);
+}
+
+TEST(FileDragTest, DescribesFileAndFolderSelectionsWithoutReadingFileContents) {
+  namespace fs = std::filesystem;
+  std::string output;
+  GUID guid {};
+  ASSERT_EQ(CoCreateGuid(&guid), S_OK);
+  wchar_t name[40] {};
+  ASSERT_TRUE(StringFromGUID2(guid, name, 40));
+  const auto folder = fs::temp_directory_path() / name;
+  ASSERT_TRUE(fs::create_directory(folder));
+  const auto file = folder / L"sample.bin";
+  ASSERT_TRUE(std::ofstream(file) << "drag");
+  auto cleanup = util::fail_guard([&] {
+    fs::remove(file);
+    fs::remove(folder);
+  });
+  EXPECT_EQ(platf::file_drag::describe({}, true, output), 200);
+  EXPECT_TRUE(nlohmann::json::parse(output)["entries"].empty());
+  ASSERT_EQ(platf::file_drag::describe({file, folder}, true, output), 200);
+  const auto entries = nlohmann::json::parse(output)["entries"];
+  ASSERT_EQ(entries.size(), 2);
+  EXPECT_EQ(entries[0]["size"], "4");
+  EXPECT_EQ(entries[0]["directory"], false);
+  EXPECT_EQ(entries[1]["directory"], true);
+  ASSERT_EQ(platf::file_drag::describe({folder}, false, output), 200);
+  EXPECT_EQ(nlohmann::json::parse(output)["directory"], win_clipboard::detail::to_utf8(folder.generic_wstring()));
+  EXPECT_EQ(platf::file_drag::describe({file}, false, output), 403);
+  EXPECT_EQ(platf::file_drag::describe({folder, folder}, false, output), 403);
+  EXPECT_EQ(platf::file_drag::describe({folder.root_path()}, true, output), 403);
+  EXPECT_EQ(platf::file_drag::describe({file.wstring() + L".missing"}, true, output), 409);
+}
+
+TEST(FileDragTest, RequiresLiveStreamGeometryAndAValidPoint) {
+  auto session = platf::make_file_browser_session();
+  std::string out;
+  auto query = [&](std::optional<std::pair<unsigned, unsigned>> point, bool grant = true) {
+    return platf::exchange_files(*session, "drag-source", {}, {}, 0, 0, {}, {}, out, [grant] {
+      return grant;
+    },
+                                 {},
+                                 {},
+                                 nullptr,
+                                 false,
+                                 point);
+  };
+  EXPECT_EQ(query(std::pair {0U, 0U}, false), 403);
+  if (query({}) == 403) {
+    GTEST_SKIP() << "This test needs an unlocked interactive Windows desktop";
+  }
+  EXPECT_EQ(query({}), 400);
+  EXPECT_EQ(query(std::pair {65536U, 0U}), 400);
+  EXPECT_EQ(query(std::pair {0U, 0U}), 403);
+  platf::set_file_drag_display(*session, 0, 0, 800, 600, 1920, 1080);
+  EXPECT_EQ(query(std::pair {0U, 0U}), 200);
+  EXPECT_TRUE(nlohmann::json::parse(out)["entries"].empty());
+}
+
 TEST(FileBrowserTest, CopiesInChunksAndCleansAbandonedUploads) {
   namespace fs = std::filesystem;
   auto session = platf::make_file_browser_session();
@@ -293,9 +386,9 @@ TEST(FileBrowserTest, CopiesInChunksAndCleansAbandonedUploads) {
   const auto active = []() {
     return true;
   };
-  const auto op = [&](std::string_view action, const fs::path &path, std::uint64_t offset = 0, std::uint64_t size = 0, std::string_view body = {}) {
+  const auto op = [&](std::string_view action, const fs::path &path, std::uint64_t offset = 0, std::uint64_t size = 0, std::string_view body = {}, bool allow = false, std::string_view replace = {}, std::string_view filter = {}) {
     out.clear();
-    return platf::exchange_files(*session, action, win_clipboard::detail::to_utf8(path.generic_wstring()), id, offset, size, {}, body, out, active);
+    return platf::exchange_files(*session, action, win_clipboard::detail::to_utf8(path.generic_wstring()), id, offset, size, {}, body, out, active, {}, {}, nullptr, allow, {}, replace, filter);
   };
   const auto drives = op("list", {});
   if (drives == 403) {
@@ -343,6 +436,21 @@ TEST(FileBrowserTest, CopiesInChunksAndCleansAbandonedUploads) {
   EXPECT_EQ(op("write", target, 0, 0), 409);
   EXPECT_EQ(op("list", dir), 200);
   EXPECT_NE(out.find("copied + file.txt"), std::string::npos);
+  EXPECT_FALSE(nlohmann::json::parse(out).at("entries").at(0).contains("replaceVersion"));
+  EXPECT_EQ(op("list", dir, 0, 0, {}, true, {}, "../other"), 400);
+  ASSERT_EQ(op("list", dir, 0, 0, {}, true, {}, "absent"), 200);
+  EXPECT_TRUE(nlohmann::json::parse(out).at("entries").empty());
+  ASSERT_EQ(op("list", dir, 0, 0, {}, true, {}, "copied + file.txt"), 200);
+  const auto version = nlohmann::json::parse(out).at("entries").at(0).at("replaceVersion").get<std::string>();
+  EXPECT_EQ(op("write", target, 0, 2, "x", false, version), 403);
+  ASSERT_EQ(op("write", target, 0, 2, "x", true, version), 204);
+  EXPECT_EQ(op("write", target, 1, 2, "y"), 409);
+  EXPECT_EQ(op("write", target, 1, 2, "y", false, version), 403);
+  EXPECT_EQ(op("read", target, 0, 5), 200);
+  EXPECT_EQ(out, "abcde");
+  ASSERT_EQ(op("write", target, 1, 2, "y", true, version), 204);
+  EXPECT_EQ(op("read", target, 0, 2), 200);
+  EXPECT_EQ(out, "xy");
   EXPECT_EQ(op("write", dir / "second", 0, 2, "x"), 204);
   EXPECT_EQ(op("abort", {}), 204);
   EXPECT_EQ(op("write", dir / "second", 1, 2, "y"), 409);
@@ -353,6 +461,54 @@ TEST(FileBrowserTest, CopiesInChunksAndCleansAbandonedUploads) {
   EXPECT_EQ(op("write", dir / "third", 0, 2, "x"), 204);
   session.reset();
   EXPECT_EQ(std::distance(fs::directory_iterator(dir), fs::directory_iterator()), 2);
+}
+
+TEST(FileBrowserTest, RequiresExplicitDeletePermissionAndAnUnchangedRegularFile) {
+  namespace fs = std::filesystem;
+  auto session = platf::make_file_browser_session();
+  std::string out;
+  const auto active = [] {
+    return true;
+  };
+  const auto exchange = [&](std::string_view op, const fs::path &path, std::uint64_t size, std::optional<std::int64_t> stamp, bool allow, const std::function<bool()> &grant) {
+    return platf::exchange_files(*session, op, win_clipboard::detail::to_utf8(path.generic_wstring()), {}, 0, size, stamp, {}, out, grant, {}, {}, nullptr, allow);
+  };
+  for (const bool allow : {false, true}) {
+    ASSERT_EQ(exchange("capabilities", {}, 0, {}, allow, active), 200);
+    EXPECT_EQ(nlohmann::json::parse(out).at("deleteFiles"), allow);
+  }
+  EXPECT_EQ(exchange("delete", {}, 0, {}, false, active), 403);
+  if (exchange("list", {}, 0, {}, true, active) == 403) {
+    GTEST_SKIP() << "This test needs an unlocked interactive Windows desktop";
+  }
+  GUID guid {};
+  ASSERT_EQ(CoCreateGuid(&guid), S_OK);
+  wchar_t unique[40] {};
+  ASSERT_TRUE(StringFromGUID2(guid, unique, 40));
+  const auto dir = fs::temp_directory_path() / unique;
+  ASSERT_TRUE(fs::create_directory(dir));
+  const auto file = dir / L"delete me.txt";
+  auto cleanup = util::fail_guard([&] {
+    std::error_code ignored;
+    fs::remove(file, ignored);
+    fs::remove(dir, ignored);
+  });
+  ASSERT_TRUE(std::ofstream(file) << "hello");
+  ASSERT_EQ(exchange("list", dir, 0, {}, true, active), 200);
+  const auto stamp = std::stoll(nlohmann::json::parse(out).at("entries").at(0).at("modified").get<std::string>());
+  EXPECT_EQ(exchange("delete", file, 5, {}, true, active), 400);
+  EXPECT_EQ(exchange("delete", file, 4, stamp, true, active), 409);
+  EXPECT_EQ(exchange("delete", file, 5, stamp + 1, true, active), 409);
+  EXPECT_EQ(exchange("delete", dir, 0, stamp, true, active), 403);
+  int checks = 0;
+  EXPECT_EQ(exchange("delete", file, 5, stamp, true, [&] {
+              return ++checks == 1;
+            }),
+            403);
+  ASSERT_TRUE(fs::exists(file));
+  EXPECT_EQ(exchange("delete", file, 5, stamp, true, active), 204);
+  EXPECT_FALSE(fs::exists(file));
+  EXPECT_EQ(exchange("delete", file, 5, stamp, true, active), 404);
 }
 
 TEST(ClipboardBatchTest, RejectsInvalidManifestsAndUses64BitLengths) {
@@ -414,7 +570,11 @@ namespace {
     const auto path = directory / L"part.bin";
     const std::string prefix(platf::file_transfer::chunk_size, 'a');
     ASSERT_TRUE(std::ofstream(path, std::ios::binary) << prefix << "tail");
+    const auto second = directory / L"second.bin";
+    ASSERT_TRUE(std::ofstream(second, std::ios::binary) << "next");
     auto selection = path.native();
+    selection.push_back(L'\0');
+    selection += second.native();
     selection.push_back(L'\0');
     const DWORD original = GetClipboardSequenceNumber();
     DWORD sequence {};
@@ -436,6 +596,42 @@ namespace {
     EXPECT_EQ(output, "tail");
     EXPECT_EQ(snapshot.read(request, sequence, sequence + 1, owner, output), 409);
     EXPECT_EQ(snapshot.read(request, sequence, sequence, owner, output), 409);
+    ASSERT_EQ(snapshot.begin(original, original, sequence, owner, output, true), 200);
+    EXPECT_TRUE(nlohmann::json::parse(output.substr(1)).at("metadataOnly").get<bool>());
+    EXPECT_TRUE(snapshot.files.empty());
+    const auto moved = directory / L"original.bin";
+    std::filesystem::rename(path, moved);
+    platf::clipboard_download_t task;
+    EXPECT_NE(snapshot.reopen(snapshot.lease, sequence, owner, task, output), 200);
+    ASSERT_TRUE(std::ofstream(path, std::ios::binary) << prefix << "fake");
+    EXPECT_EQ(snapshot.reopen(snapshot.lease, sequence, owner, task, output), 409);
+    ASSERT_TRUE(std::filesystem::remove(path));
+    std::filesystem::rename(moved, path);
+    // The clipboard manager can publish another format after the client receives
+    // its descriptors. A paste claims the original selection without rereading it.
+    DWORD newer {};
+    ASSERT_EQ(win_clipboard::publish(L"another format", false, newer, sequence, {}), 204);
+    ASSERT_NE(newer, sequence);
+    EXPECT_EQ(snapshot.reopen(snapshot.lease + 1, sequence, owner, task, output), 409);
+    EXPECT_EQ(snapshot.reopen(snapshot.lease, newer, owner, task, output), 409);
+    EXPECT_EQ(snapshot.reopen(snapshot.lease, sequence, LUID {4, 7}, task, output), 409);
+    ASSERT_EQ(snapshot.reopen(snapshot.lease, sequence, owner, task, output), 200);
+    std::filesystem::rename(path, moved);
+    ASSERT_TRUE(std::ofstream(path, std::ios::binary) << prefix << "fake");
+    request.lease = task.lease;
+    ASSERT_EQ(task.read(request, sequence, {}, owner, output), 200);
+    EXPECT_EQ(output, "tail");
+    ASSERT_TRUE(DeleteFileW(moved.c_str()));
+    request.file = 1;
+    request.offset = 0;
+    ASSERT_EQ(task.read(request, sequence, {}, owner, output), 200);
+    EXPECT_EQ(output, "next");
+    request.op = "finish";
+    ASSERT_EQ(task.read(request, sequence, {}, owner, output), 204);
+    EXPECT_EQ(snapshot.reopen(snapshot.lease, sequence, owner, task, output), 409);
+    EXPECT_TRUE(task.files.empty());
+    EXPECT_FALSE(std::filesystem::exists(moved));
+    EXPECT_TRUE(std::filesystem::remove(second));
     EXPECT_TRUE(std::filesystem::remove(path));
     EXPECT_TRUE(std::filesystem::remove(directory));
   }

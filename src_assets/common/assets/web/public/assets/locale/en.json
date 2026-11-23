@@ -354,6 +354,8 @@
     "host_power_desc": "Paired clients can request a shutdown or restart of this Windows PC even when no stream is running. Clear this setting to disable those requests.",
     "file_browser": "Browse and transfer files",
     "file_browser_desc": "Allow paired clients to browse local drives and copy files accessible to the signed-in Windows user through a file connection or during a stream.",
+    "file_browser_delete": "Allow file deletion",
+    "file_browser_delete_desc": "Allow paired clients with file browsing access to permanently delete individual files accessible to the signed-in Windows user.",
     "clipboard_files": "Transfer copied files",
     "clipboard_files_desc": "Allow paired clients to exchange newly copied local files during a stream. The client must also enable file transfer.",
     "native_pen_touch": "Native Pen/Touch Support",

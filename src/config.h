@@ -298,6 +298,7 @@ namespace config {
     bool clipboard_text {};  ///< Allow paired streams to exchange text on Windows.
     bool host_power {};  ///< Allow paired clients to request a Windows shutdown or restart.
     bool file_browser {};  ///< Allow paired clients to browse and transfer local files on Windows.
+    bool file_browser_delete {};  ///< Allow a file browser session to delete regular files as the signed-in user.
     bool clipboard_files {};  ///< Allow paired streams to exchange copied files on Windows.
     bool clipboard_images {};  ///< Allow paired streams to exchange copied images on Windows.
   };

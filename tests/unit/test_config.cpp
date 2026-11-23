@@ -221,7 +221,7 @@ TEST_F(ConfigPersistenceTest, ParsesFp16SdrGammaEncodedOption) {
 }
 
 /**
- * @brief File browsing and power requests default to enabled and obey independent overrides.
+ * @brief File browsing, deletion and power requests default to enabled and obey independent overrides.
  */
 TEST_F(ConfigPersistenceTest, FileBrowserEnabledByDefaultAndCanBeDisabled) {
   const auto original_nvhttp = config::nvhttp;
@@ -234,6 +234,7 @@ TEST_F(ConfigPersistenceTest, FileBrowserEnabledByDefaultAndCanBeDisabled) {
 
   config::apply_config_for_test("");
   EXPECT_TRUE(config::nvhttp.file_browser);
+  EXPECT_TRUE(config::nvhttp.file_browser_delete);
   EXPECT_FALSE(config::nvhttp.clipboard_files);
   EXPECT_FALSE(config::nvhttp.clipboard_text);
   EXPECT_TRUE(config::nvhttp.host_power);
@@ -243,8 +244,11 @@ TEST_F(ConfigPersistenceTest, FileBrowserEnabledByDefaultAndCanBeDisabled) {
   config::apply_config_for_test("file_browser = disabled\nhost_power = enabled\n");
   EXPECT_FALSE(config::nvhttp.file_browser);
   EXPECT_TRUE(config::nvhttp.host_power);
-  config::apply_config_for_test("file_browser = enabled\n");
+  config::apply_config_for_test("file_browser = enabled\nfile_browser_delete = enabled\n");
   EXPECT_TRUE(config::nvhttp.file_browser);
+  EXPECT_TRUE(config::nvhttp.file_browser_delete);
+  config::apply_config_for_test("file_browser_delete = disabled\n");
+  EXPECT_FALSE(config::nvhttp.file_browser_delete);
 }
 
 /**

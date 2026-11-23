@@ -38,6 +38,8 @@ extern "C" {
 #include "video.h"
 
 #ifdef _WIN32
+  #include "platform/windows/clipboard.h"
+  #include "stream.h"
 extern "C" {
   #include <libavutil/hwcontext_d3d11va.h>
 }
@@ -2678,6 +2680,19 @@ namespace video {
     };
   }
 
+  /** @brief Publish the same active display to absolute input and file hit-testing. */
+  static input::touch_port_t stream_port(platf::display_t *display, const config_t &config, stream::session_t *session) {
+#ifdef _WIN32
+    if (session) {
+      const auto &files = stream::session::clipboard_grant(*session).formats.browser_session;
+      if (files) {
+        platf::set_file_drag_display(*files, display->offset_x, display->offset_y, display->width, display->height, config.width, config.height);
+      }
+    }
+#endif
+    return make_port(display, config);
+  }
+
   /**
    * @brief Create encode device.
    *
@@ -2753,7 +2768,7 @@ namespace video {
     }
 
     // absolute mouse coordinates require that the dimensions of the screen are known
-    ctx.touch_port_events->raise(make_port(disp, ctx.config));
+    ctx.touch_port_events->raise(stream_port(disp, ctx.config, ctx.channel_data));
 
     // Update client with our current HDR display state
     auto hdr_info = std::make_unique<hdr_info_raw_t>(false);
@@ -3038,7 +3053,7 @@ namespace video {
       }
 
       // absolute mouse coordinates require that the dimensions of the screen are known
-      touch_port_event->raise(make_port(display.get(), config));
+      touch_port_event->raise(stream_port(display.get(), config, channel_data));
 
       // Update client with our current HDR display state
       auto hdr_info = std::make_unique<hdr_info_raw_t>(false);

@@ -1,9 +1,11 @@
 /**
  * @file src/platform/windows/file_browser.cpp
- * @brief List and copy files on local Windows volumes for an authorized streaming client.
+ * @brief Browse, copy and delete files on local Windows volumes for an authorized client.
  */
 #include "clipboard.h"
+#include "clipboard_selection.h"
 #include "clipboard_win32.h"
+#include "file_drag.h"
 #include "file_transfer.h"
 #include "interactive_desktop.h"
 #include "src/utility.h"
@@ -39,6 +41,26 @@ namespace platf {
       }
       file_handle directory(handle);
       return true;
+    }
+
+    /** @brief UI Automation must connect to Explorer from its logon, including in a service installation. */
+    int drag_paths(HANDLE user, const LUID &logon, POINT point, bool source, std::vector<std::wstring> &paths) {
+      HANDLE raw {};
+      if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw)) {
+        file_handle process_token(raw);
+        TOKEN_STATISTICS stats {};
+        DWORD needed {};
+        if (GetTokenInformation(raw, TokenStatistics, &stats, sizeof(stats), &needed) && stats.AuthenticationId.HighPart == logon.HighPart && stats.AuthenticationId.LowPart == logon.LowPart) {
+          paths = shell_file_drop::paths_at(point, source, user);
+          return 200;
+        }
+      }
+      std::vector<fs::path> result;
+      const auto status = selection::read_as_user(user, 0, result, source ? selection::operation_t::drag_source : selection::operation_t::drop_target, point);
+      for (const auto &path : result) {
+        paths.emplace_back(path.native());
+      }
+      return status == 204 ? 200 : status;
     }
 
     /** @brief Append local drives as browser entries or as labeled sidebar locations. */
@@ -106,8 +128,12 @@ namespace platf {
     }
 
     /** @brief List directory entries using metadata returned by a single enumeration. */
-    int list_files(const fs::path &dir, std::string &output) {
+    int list_files(const fs::path &dir, std::string &output, bool allow_replace, std::string_view name_filter) {
       auto entries = nlohmann::json::array();
+      const auto pattern = name_filter.empty() ? L"*" : from_utf8(name_filter);
+      if (!name_filter.empty() && (dir.empty() || !valid_name(pattern))) {
+        return 400;
+      }
       if (dir.empty()) {
         const auto result = append_drives(entries, false);
         if (result != 200) {
@@ -120,7 +146,7 @@ namespace platf {
           return status;
         }
         WIN32_FIND_DATAW data {};
-        auto find = FindFirstFileW((dir / L"*").c_str(), &data);
+        auto find = FindFirstFileW((dir / pattern).c_str(), &data);
         if (find == INVALID_HANDLE_VALUE) {
           if (GetLastError() != ERROR_FILE_NOT_FOUND) {
             return file_error();
@@ -145,6 +171,9 @@ namespace platf {
               return 413;
             }
             entries.push_back({{"name", name}, {"path", path}, {"directory", directory}, {"size", std::to_string(size)}, {"modified", std::to_string(milliseconds(data.ftLastWriteTime))}});
+            if (allow_replace && !directory && !name_filter.empty()) {
+              entries.back()["replaceVersion"] = replacement_version(dir / data.cFileName);
+            }
           } while (FindNextFileW(find, &data));
           if (GetLastError() != ERROR_NO_MORE_FILES) {
             return file_error();
@@ -161,6 +190,7 @@ namespace platf {
       std::uint64_t size;  ///< Declared final length.
       std::uint64_t offset;  ///< Bytes accepted in order.
       file_handle file;  ///< Staging file marked for deletion on close.
+      std::string replace;  ///< Version of the destination selected for replacement.
     };
   }  // namespace
 
@@ -169,9 +199,15 @@ namespace platf {
     std::uint64_t serial {};  ///< Issue order of authenticated file grants.
     std::map<std::string, file_transfer::identity_job_t> identities;  ///< Incremental source hashes.
     std::mutex mutex;  ///< Serialize writes and cancellations.
+    file_drag::display_t display;  ///< Empty for standalone browser grants.
     std::optional<LUID> logon;  ///< Desktop logon that owns this connection and its upload handles.
     std::map<std::string, upload_t> uploads;  ///< Pending uploads identified by client nonce.
   };
+
+  void set_file_drag_display(file_browser_session_t &session, int left, int top, int width, int height, int stream_width, int stream_height) {
+    std::lock_guard guard(session.mutex);
+    session.display = {left, top, width, height, stream_width, stream_height};
+  }
 
   namespace {
     std::mutex session_registry_mutex;
@@ -191,7 +227,7 @@ namespace platf {
   }
 
   /** @brief Append one chunk, then publish or discard the staging file when finished. */
-  static int write_chunk(file_browser_session_t &session, const fs::path &path, const std::string &id, std::uint64_t offset, std::uint64_t size, std::string_view input, const std::function<bool()> &active) {
+  static int write_chunk(file_browser_session_t &session, const fs::path &path, const std::string &id, std::uint64_t offset, std::uint64_t size, std::string_view input, const std::function<bool()> &active, std::string_view replace) {
     if (input.size() > chunk_size || input.size() > size - offset || (input.empty() && size)) {
       return 400;
     }
@@ -205,14 +241,14 @@ namespace platf {
         return 429;
       }
       file_handle file;
-      const auto status = create_staging(path, file);
+      const auto status = create_staging(path, file, replace);
       if (status != 200) {
         return status;
       }
-      found = session.uploads.emplace(id, upload_t {path, size, 0, std::move(file)}).first;
+      found = session.uploads.emplace(id, upload_t {path, size, 0, std::move(file), std::string(replace)}).first;
     }
     auto &upload = found->second;
-    if (upload.size != size || upload.offset != offset || upload.destination != path) {
+    if (upload.size != size || upload.offset != offset || upload.destination != path || upload.replace != replace) {
       return 409;
     }
     DWORD written {};
@@ -226,7 +262,7 @@ namespace platf {
       if (upload.offset < size) {
         return 204;
       }
-      result = active() ? publish_file(upload.file.get(), path) : 403;
+      result = active() ? publish_file(upload.file.get(), path, replace) : 403;
     }
     session.uploads.erase(found);
     return result;
@@ -256,18 +292,21 @@ namespace platf {
     }
   }
 
-  int exchange_files(file_browser_session_t &session, std::string_view operation, std::string_view name, const std::string &id, std::uint64_t offset, std::uint64_t size, std::optional<std::int64_t> modified, std::string_view input, std::string &output, const std::function<bool()> &active, std::string_view cert, std::string_view digest, std::optional<std::uint64_t> *ack) {
+  int exchange_files(file_browser_session_t &session, std::string_view operation, std::string_view name, const std::string &id, std::uint64_t offset, std::uint64_t size, std::optional<std::int64_t> modified, std::string_view input, std::string &output, const std::function<bool()> &active, std::string_view cert, std::string_view digest, std::optional<std::uint64_t> *ack, bool allow_delete, std::optional<std::pair<unsigned, unsigned>> drag_point, std::string_view replace, std::string_view name_filter) {
     if ((operation == "write" || operation == "abort" || operation == "resume" || operation == "chunk" || operation == "commit" || operation == "discard" || operation == "identity") && (id.size() != 32 || id.find_first_not_of("0123456789abcdef") != std::string::npos)) {
       return 400;
     }
     if (size > static_cast<std::uint64_t>((std::numeric_limits<LONGLONG>::max)()) || offset > size || name.size() > 4 * 32767) {
       return 400;
     }
-    if (!active()) {
+    if (!replace.empty() && (replace.size() > 96 || (operation != "write" && operation != "resume" && operation != "commit"))) {
+      return 400;
+    }
+    if (!active() || ((operation == "delete" || !replace.empty()) && !allow_delete)) {
       return 403;
     }
     if (operation == "capabilities") {
-      output = R"({"version":2})";
+      output = nlohmann::json({{"version", 2}, {"deleteFiles", allow_delete}}).dump();
       return 200;
     }
     if (operation == "abort") {
@@ -297,6 +336,32 @@ namespace platf {
     if (operation == "places") {
       return list_places(user.token, output);
     }
+    if (operation == "drag-source" || operation == "drop-target") {
+      if (!drag_point || drag_point->first > 65535 || drag_point->second > 65535) {
+        return 400;
+      }
+      file_drag::display_t display;
+      {
+        std::lock_guard guard(session.mutex);
+        display = session.display;
+      }
+      if (!display.width) {
+        return 403;
+      }
+      const auto point = display.point(drag_point->first, drag_point->second, {GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN)});
+      const bool source = operation == "drag-source";
+      std::vector<std::wstring> paths;
+      if (point) {
+        const auto status = drag_paths(user.token, stats.AuthenticationId, *point, source, paths);
+        if (status != 200) {
+          return status;
+        }
+      }
+      if (!active() || !desktop::on_user_desktop()) {
+        return 403;
+      }
+      return file_drag::describe(paths, source, output);
+    }
     auto wide = from_utf8(name);
     if ((!name.empty() && wide.empty()) || wide.find(L'\0') != std::wstring::npos) {
       return 400;
@@ -304,7 +369,7 @@ namespace platf {
     std::replace(wide.begin(), wide.end(), L'/', L'\\');
     const fs::path path(wide);
     if (operation == "list") {
-      return list_files(path, output);
+      return list_files(path, output, allow_delete, name_filter);
     }
     if (!valid_name(path.filename().native())) {
       return 400;
@@ -316,7 +381,7 @@ namespace platf {
     }
     if (operation == "resume" || operation == "chunk" || operation == "commit" || operation == "discard") {
       std::optional<std::uint64_t> confirmed;
-      const int status = resumable_files.exchange(operation, cert, stats.AuthenticationId, session.serial, path, id, digest, offset, size, input, pins, output, confirmed, active);
+      const int status = resumable_files.exchange(operation, cert, stats.AuthenticationId, session.serial, path, id, digest, offset, size, input, pins, output, confirmed, active, replace);
       if (ack) {
         *ack = confirmed;
       }
@@ -329,8 +394,22 @@ namespace platf {
     if (operation == "read") {
       return read_file(path, offset, size, modified, output);
     }
+    if (operation == "delete") {
+      if (!modified) {
+        return 400;
+      }
+      file_handle file;
+      const auto status = open_source(path, size, modified, file, FILE_READ_ATTRIBUTES | DELETE);
+      if (status != 200) {
+        return status;
+      }
+      if (!active()) {
+        return 403;
+      }
+      return disposition(file.get(), true) ? 204 : file_error();
+    }
     if (operation == "write") {
-      return write_chunk(session, path, id, offset, size, input, active);
+      return write_chunk(session, path, id, offset, size, input, active, replace);
     }
     if (operation == "mkdir") {
       if (!active()) {

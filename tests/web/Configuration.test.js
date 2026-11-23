@@ -28,7 +28,7 @@ const globalOptions = {
 }
 
 describe('clipboard settings', () => {
-  it.each(['file_browser', 'host_power'])('enables %s by default and shows its saved opt-out', option => {
+  it.each(['file_browser', 'file_browser_delete', 'host_power'])('enables %s by default and shows its saved opt-out', option => {
     const defaults = configTabs.find(tab => tab.id === 'input').options
     expect(defaults[option]).toBe('enabled')
     const wrapper = mount(Inputs, {
@@ -47,7 +47,7 @@ describe('clipboard settings', () => {
       props: { platform, config: { ...defaults } },
       global: globalOptions,
     })
-    for (const option of ['clipboard_text', 'clipboard_images', 'clipboard_files', 'file_browser', 'host_power']) {
+    for (const option of ['clipboard_text', 'clipboard_images', 'clipboard_files', 'file_browser', 'file_browser_delete', 'host_power']) {
       expect(wrapper.find(`#${option}`).exists()).toBe(platform === 'windows')
     }
   })

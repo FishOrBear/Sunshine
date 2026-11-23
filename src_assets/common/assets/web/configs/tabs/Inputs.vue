@@ -149,6 +149,14 @@ watch(
 
     <Checkbox v-if="platform === 'windows'"
               class="mb-3"
+              id="file_browser_delete"
+              locale-prefix="config"
+              v-model="config.file_browser_delete"
+              default="true"
+    ></Checkbox>
+
+    <Checkbox v-if="platform === 'windows'"
+              class="mb-3"
               id="host_power"
               locale-prefix="config"
               v-model="config.host_power"

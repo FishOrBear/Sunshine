@@ -90,9 +90,9 @@ namespace platf::file_transfer {
     return static_cast<std::int64_t>(stamp.QuadPart / 10000) - 11644473600000LL;
   }
 
-  /** @brief Open a read-only local file and verify the listing against the pinned handle. */
-  inline int open_source(const fs::path &path, std::uint64_t size, std::optional<std::int64_t> modified, file_handle &file) {
-    HANDLE raw = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+  /** @brief Open a regular file with the requested access and verify the listing against the pinned handle. */
+  inline int open_source(const fs::path &path, std::uint64_t size, std::optional<std::int64_t> modified, file_handle &file, DWORD access = GENERIC_READ, DWORD share = FILE_SHARE_READ) {
+    HANDLE raw = CreateFileW(path.c_str(), access, share, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
     if (raw == INVALID_HANDLE_VALUE) {
       return file_error();
     }
@@ -144,11 +144,20 @@ namespace platf::file_transfer {
     return SetFileInformationByHandle(file, FileDispositionInfo, &info, sizeof(info));
   }
 
-  /** @brief Move the pinned staging file to its final name without replacing an existing entry. */
-  inline int rename_staged_file(HANDLE file, const fs::path &path) {
+  /** @brief Identify the current regular file for a conditional replacement. */
+  inline std::string replacement_version(const fs::path &path);
+
+  /** @brief Publish the staging handle, replacing only an explicitly selected file version. */
+  inline int rename_staged_file(HANDLE file, const fs::path &path, std::string_view replace = {}) {
     const auto &name = path.native();
     std::vector<unsigned char> data(sizeof(FILE_RENAME_INFO) + name.size() * sizeof(wchar_t));
     auto info = reinterpret_cast<FILE_RENAME_INFO *>(data.data());
+    if (!replace.empty()) {
+      if (replacement_version(path) != replace) {
+        return 409;
+      }
+      info->ReplaceIfExists = TRUE;
+    }
     info->FileNameLength = static_cast<DWORD>(name.size() * sizeof(wchar_t));
     std::memcpy(info->FileName, name.data(), info->FileNameLength);
     if (!disposition(file, false)) {
@@ -163,8 +172,8 @@ namespace platf::file_transfer {
   }
 
   /** @brief Flush a standalone transfer before acknowledging its final rename. */
-  inline int publish_file(HANDLE file, const fs::path &path) {
-    return FlushFileBuffers(file) ? rename_staged_file(file, path) : file_error();
+  inline int publish_file(HANDLE file, const fs::path &path, std::string_view replace = {}) {
+    return FlushFileBuffers(file) ? rename_staged_file(file, path, replace) : file_error();
   }
 
   /** @brief Create a private, delete-pending staging file on the destination volume. */
@@ -192,12 +201,15 @@ namespace platf::file_transfer {
     return 200;
   }
 
-  /** @brief Stage a standalone transfer only when its final filename is available. */
-  inline int create_staging(const fs::path &path, file_handle &file) {
-    if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+  /** @brief Stage beside a free name or a matching, authorized replacement target. */
+  inline int create_staging(const fs::path &path, file_handle &file, std::string_view replace = {}) {
+    if (!replace.empty()) {
+      if (replacement_version(path) != replace) {
+        return 409;
+      }
+    } else if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
       return 409;
-    }
-    if (GetLastError() != ERROR_FILE_NOT_FOUND) {
+    } else if (GetLastError() != ERROR_FILE_NOT_FOUND) {
       return file_error();
     }
     return create_staging_in(path.parent_path(), file, FILE_ATTRIBUTE_NORMAL);
@@ -307,6 +319,14 @@ namespace platf::file_transfer {
     return inspect(raw);
   }
 
+  inline std::string replacement_version(const fs::path &path) {
+    const auto info = inspect_path(path);
+    if (!info) {
+      return {};
+    }
+    return std::to_string(info->volume) + "-" + std::to_string(info->index) + "-" + std::to_string(info->changed) + "-" + std::to_string(info->size);
+  }
+
   /** @brief Retain authenticated sequential prefixes and short-lived idempotent publication receipts. */
   class resume_store_t {
   public:
@@ -319,7 +339,7 @@ namespace platf::file_transfer {
     }
 
     /** @brief Process one validated transfer under the active desktop user's security context. */
-    int exchange(std::string_view operation, std::string_view cert, LUID logon, std::uint64_t session, const fs::path &path, const std::string &id, std::string_view sha, std::uint64_t offset, std::uint64_t size, std::string_view bytes, std::vector<file_handle> &pins, std::string &output, std::optional<std::uint64_t> &ack, const std::function<bool()> &active) {
+    int exchange(std::string_view operation, std::string_view cert, LUID logon, std::uint64_t session, const fs::path &path, const std::string &id, std::string_view sha, std::uint64_t offset, std::uint64_t size, std::string_view bytes, std::vector<file_handle> &pins, std::string &output, std::optional<std::uint64_t> &ack, const std::function<bool()> &active, std::string_view replace = {}) {
       std::lock_guard guard(mutex);
       if (cert.empty() || !session || !active()) {
         return 403;
@@ -363,7 +383,7 @@ namespace platf::file_transfer {
             records.erase(oldest);
           }
           record_t r;
-          const int status = create_staging(path, r.file);
+          const int status = create_staging(path, r.file, replace);
           if (status != 200) {
             return status;
           }
@@ -376,9 +396,10 @@ namespace platf::file_transfer {
           r.path = path;
           r.size = size;
           r.sha = sha;
+          r.replace = replace;
           r.pins = std::move(pins);
           it = records.insert(records.end(), std::move(r));
-        } else if (it->path != path || it->size != size || it->sha != sha || (!it->file && !same_destination(*it))) {
+        } else if (it->path != path || it->size != size || it->sha != sha || it->replace != replace || (!it->file && !same_destination(*it))) {
           return 409;
         }
         const auto lease = new_file_lease();
@@ -423,6 +444,9 @@ namespace platf::file_transfer {
       if (operation != "commit") {
         return 400;
       }
+      if (it->replace != replace) {
+        return 409;
+      }
       if (!it->file) {
         return same_destination(*it) ? 204 : 409;
       }
@@ -438,7 +462,7 @@ namespace platf::file_transfer {
         records.erase(it);
         return before ? 403 : 500;
       }
-      const auto status = publish_file(it->file.get(), path);
+      const auto status = publish_file(it->file.get(), path, replace);
       if (status != 204) {
         records.erase(it);
         return status;
@@ -458,6 +482,7 @@ namespace platf::file_transfer {
     /** @brief State scoped to one paired certificate, Windows logon and persistent task ID. */
     struct record_t {
       std::string cert, task, sha, lease;
+      std::string replace;  ///< Listed target version approved for replacement, empty for a new file.
       LUID logon {};
       fs::path path;
       std::uint64_t session {}, size {}, offset {};
