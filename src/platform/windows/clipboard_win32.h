@@ -4,6 +4,8 @@
  */
 #pragma once
 
+#include "clipboard_image.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -361,9 +363,10 @@ namespace win_clipboard {
   }  // namespace detail
 
   /** @brief Export a new clipboard revision according to the negotiated format permissions. */
-  inline int read(bool text, bool files, DWORD since, std::string &payload, DWORD &sequence) {
+  inline int read(bool text, bool files, DWORD since, std::string &payload, DWORD &sequence, bool images = false) {
     payload.clear();
     std::vector<fs::path> paths;
+    clipboard_image::snapshot image;
     {
       detail::clipboard_lock lock(nullptr);
       if (!lock.opened) {
@@ -389,11 +392,20 @@ namespace win_clipboard {
         if (paths.empty()) {
           return 204;
         }
+      } else if (images && clipboard_image::available()) {
+        const int status = clipboard_image::capture(image);
+        if (status != 200) {
+          return status;
+        }
       } else if (text && IsClipboardFormatAvailable(CF_UNICODETEXT)) {
         return detail::read_text(payload);
       } else {
         return 204;
       }
+    }
+    if (paths.empty()) {
+      const int status = clipboard_image::encode(image, payload);
+      return GetClipboardSequenceNumber() == sequence ? status : 409;
     }
     payload = "F";
     for (const auto &path : paths) {
@@ -407,8 +419,7 @@ namespace win_clipboard {
   }
 
   /** @brief Publish text or a NUL-separated list of fully staged file paths under a final stream and revision guard. */
-  inline int publish(std::wstring_view value, bool files, DWORD &sequence, std::optional<DWORD> expected, const std::function<bool()> &grant_active) {
-    HGLOBAL data = detail::make_data(value, files);
+  inline int publish_data(UINT format, HGLOBAL data, DWORD &sequence, std::optional<DWORD> expected, const std::function<bool()> &grant_active, std::string_view png = {}) {
     if (!data) {
       return 500;
     }
@@ -429,8 +440,9 @@ namespace win_clipboard {
         sequence = GetClipboardSequenceNumber();
         if (expected && *expected != sequence) {
           status = 409;
-        } else if (EmptyClipboard() && SetClipboardData(files ? CF_HDROP : CF_UNICODETEXT, data)) {
+        } else if (EmptyClipboard() && SetClipboardData(format, data)) {
           data = nullptr;
+          clipboard_image::offer_png(png);
           sequence = GetClipboardSequenceNumber();
           status = 204;
         }
@@ -453,10 +465,29 @@ namespace win_clipboard {
     return status;
   }
 
+  inline int publish(std::wstring_view value, bool files, DWORD &sequence, std::optional<DWORD> expected, const std::function<bool()> &grant_active) {
+    return publish_data(files ? CF_HDROP : CF_UNICODETEXT, detail::make_data(value, files), sequence, expected, grant_active);
+  }
+
   /** @brief Apply a clipboard packet, optionally only if the current sequence still matches. */
-  inline int write(bool text, bool files, std::string_view payload, DWORD &sequence, const fs::path &staging_root, std::optional<DWORD> expected = std::nullopt, const std::function<bool()> &grant_active = {}) {
+  inline int write(bool text, bool files, std::string_view payload, DWORD &sequence, const fs::path &staging_root, std::optional<DWORD> expected = std::nullopt, const std::function<bool()> &grant_active = {}, bool images = false) {
     if (payload.empty()) {
       return 400;
+    }
+    if (payload.front() == 'I') {
+      if (!images) {
+        return 403;
+      }
+      if (payload.size() > clipboard_image::max_packet) {
+        return 413;
+      }
+      HGLOBAL bitmap = nullptr;
+      const auto png = payload.substr(1);
+      int status = clipboard_image::decode(png, bitmap);
+      if (status == 200) {
+        status = publish_data(CF_DIBV5, bitmap, sequence, expected, grant_active, png);
+      }
+      return status == 423 ? 409 : status;
     }
     if (payload.size() > max_body) {
       return 413;

@@ -508,6 +508,7 @@ namespace nvhttp {
     if (grant.formats.matches_any()) {
       tree.put("root.clipboardversion", 1);
       tree.put("root.clipboardtext", grant.formats.text ? 1 : 0);
+      tree.put("root.clipboardimages", grant.formats.images ? 1 : 0);
       tree.put("root.clipboardfiles", grant.formats.files ? 1 : 0);
       if (grant.formats.upload_session) {
         tree.put("root.clipboardbatchversion", grant.formats.resumable ? 2 : 1);
@@ -580,11 +581,11 @@ namespace nvhttp {
     launch_session->client_name = identity.second;
 #ifdef _WIN32
     if (!identity.first.empty()) {
-      launch_session->clipboard_grant = clipboard::negotiate(
-        {config::nvhttp.clipboard_text, config::nvhttp.clipboard_files, 0, config::nvhttp.file_browser},
-        {get_arg(args, "clipboardtext", "0") == "1", get_arg(args, "clipboardfiles", "0") == "1", 0, get_arg(args, "filebrowser", "0") == "1"},
-        get_arg(args, "clipboardtoken", "")
-      );
+      clipboard::formats_t host {config::nvhttp.clipboard_text, config::nvhttp.clipboard_files, 0, config::nvhttp.file_browser};
+      host.images = config::nvhttp.clipboard_images;
+      clipboard::formats_t client {get_arg(args, "clipboardtext", "0") == "1", get_arg(args, "clipboardfiles", "0") == "1", 0, get_arg(args, "filebrowser", "0") == "1"};
+      client.images = get_arg(args, "clipboardimages", "0") == "1";
+      launch_session->clipboard_grant = clipboard::negotiate(host, client, get_arg(args, "clipboardtoken", ""));
       if (launch_session->clipboard_grant.formats.files) {
         launch_session->clipboard_grant.formats.resumable = get_arg(args, "clipboardbatchversion", "") == "2";
         launch_session->clipboard_grant.formats.upload_session = platf::make_clipboard_upload_session(identity.first);
@@ -2004,7 +2005,7 @@ namespace nvhttp {
       since = value;
     }
 
-    constexpr std::size_t max_body = 16 * 1024 * 1024;
+    const std::size_t max_body = formats.images ? clipboard::max_image_packet : 16 * 1024 * 1024;
     if (request->content.size() > max_body) {
       response->write(status::client_error_payload_too_large);
       return;
@@ -2016,7 +2017,21 @@ namespace nvhttp {
     auto allowed = formats;
     if (!upload) {
       allowed.text &= get_arg(args, "text", "0") == "1";
+      allowed.images &= get_arg(args, "images", "0") == "1";
       allowed.files &= get_arg(args, "files", "0") == "1";
+    }
+
+    platf::clipboard_download_request_t download;
+    download.op = get_arg(args, "download", "");
+    if (!download.op.empty()) {
+      if (upload || !allowed.files || !allowed.upload_session) {
+        response->write(status::client_error_forbidden);
+        return;
+      }
+      if (download.op != "1" && ((!since || (download.op != "chunk" && download.op != "finish")) || !parse_clipboard_number(get_arg(args, "lease", ""), download.lease) || (download.op == "chunk" && (!parse_clipboard_number(get_arg(args, "file", ""), download.file) || !parse_clipboard_number(get_arg(args, "offset", ""), download.offset))))) {
+        response->write(status::client_error_bad_request);
+        return;
+      }
     }
 
     std::string payload;
@@ -2026,7 +2041,7 @@ namespace nvhttp {
       const auto grant_active = [&]() {
         return rtsp_stream::clipboard_formats(cert, token->second).matches_any();
       };
-      auto result = platf::exchange_clipboard(allowed, upload, since, input, payload, sequence, grant_active);
+      auto result = platf::exchange_clipboard(allowed, upload, since, input, payload, sequence, grant_active, download);
       if (result == 200 && !grant_active()) {
         response->write(status::client_error_forbidden);
         return;
@@ -2188,7 +2203,7 @@ namespace nvhttp {
       };
     }
     // Bound the TLS server's buffering before the request reaches a clipboard handler.
-    https_server.config.max_request_streambuf_size = 16 * 1024 * 1024;
+    https_server.config.max_request_streambuf_size = clipboard::max_image_packet + 64 * 1024;
     https_server.resource["^/clipboard/batch$"]["POST"] = [&](auto resp, auto req) {
       handle_clipboard_batch(resp, req, https_server.client_identity(*req).first);
     };

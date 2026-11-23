@@ -31,6 +31,7 @@
       "mouse": "enabled",
       "high_resolution_scrolling": "enabled",
       "clipboard_text": "disabled",
+      "clipboard_images": "disabled",
       "clipboard_files": "disabled",
       "file_browser": "enabled",
       "host_power": "enabled",

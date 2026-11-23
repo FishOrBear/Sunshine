@@ -125,6 +125,14 @@ watch(
 
     <Checkbox v-if="platform === 'windows'"
               class="mb-3"
+              id="clipboard_images"
+              locale-prefix="config"
+              v-model="config.clipboard_images"
+              default="false"
+    ></Checkbox>
+
+    <Checkbox v-if="platform === 'windows'"
+              class="mb-3"
               id="clipboard_files"
               locale-prefix="config"
               v-model="config.clipboard_files"

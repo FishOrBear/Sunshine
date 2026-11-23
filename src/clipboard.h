@@ -18,6 +18,8 @@ namespace platf {
 }  // namespace platf
 
 namespace clipboard {
+  constexpr std::size_t max_image_packet = 64 * 1024 * 1024;  ///< PNG clipboard packet, including its format byte.
+
   /**
    * @brief Clipboard formats enabled at both ends of a stream.
    */
@@ -33,6 +35,8 @@ namespace clipboard {
 
     bool resumable {};  ///< Client opted into content-verified reconnect support.
 
+    bool images {};  ///< Clipboard bitmap exchange is enabled on both peers.
+
     /** @brief Skip contents predating this stream and revisions the client already received. */
     bool should_read(std::uint32_t current, std::optional<std::uint32_t> since) const {
       return since && current != initial_sequence && current != *since;
@@ -40,7 +44,7 @@ namespace clipboard {
 
     /** @brief Check whether this stream has any clipboard permission. */
     bool matches_any() const {
-      return text || files;
+      return text || files || images;
     }
   };
 
@@ -67,6 +71,7 @@ namespace clipboard {
   /** @brief Negotiate a grant only for explicitly enabled formats and a well-formed token. */
   inline grant_t negotiate(formats_t host, formats_t client, std::string token) {
     formats_t formats {host.text && client.text, host.files && client.files};
+    formats.images = host.images && client.images;
     formats.browser = host.browser && client.browser;
     if ((!formats.matches_any() && !formats.browser) || !valid_token(token)) {
       return {};

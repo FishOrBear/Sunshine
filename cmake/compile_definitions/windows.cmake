@@ -108,6 +108,7 @@ list(PREPEND PLATFORM_LIBRARIES
         ntdll
         setupapi
         shlwapi
+        windowscodecs
         synchronization.lib
         userenv
         ws2_32

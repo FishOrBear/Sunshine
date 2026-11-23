@@ -15,6 +15,7 @@
 
   // platform includes
   #include "src/platform/windows/clipboard.h"
+  #include "src/platform/windows/clipboard_download.h"
   #include "src/platform/windows/clipboard_resume.h"
   #include "src/platform/windows/clipboard_upload.h"
   #include "src/platform/windows/clipboard_win32.h"
@@ -38,6 +39,21 @@ TEST(ClipboardGrantTest, RequiresMutualConsentAndValidCapability) {
     EXPECT_FALSE(grant.matches(invalid));
     EXPECT_FALSE(grant.formats.matches_any());
   }
+}
+
+TEST(ClipboardGrantTest, ImageSyncRequiresPermissionOnBothPeers) {
+  const std::string token(64, 'a');
+  clipboard::formats_t images;
+  images.images = true;
+  const clipboard::formats_t other {true, true};
+  const auto granted = clipboard::negotiate(images, images, token);
+  EXPECT_TRUE(granted.matches(token));
+  EXPECT_TRUE(granted.formats.images);
+  EXPECT_FALSE(granted.formats.files);
+  EXPECT_FALSE(granted.formats.text);
+  EXPECT_FALSE(clipboard::negotiate(images, other, token).matches(token));
+  EXPECT_FALSE(clipboard::negotiate(other, images, token).matches(token));
+  EXPECT_FALSE(clipboard::negotiate(images, images, "").formats.matches_any());
 }
 
 TEST(ClipboardGrantTest, FileBrowserRequiresSeparateBilateralPermission) {
@@ -93,6 +109,8 @@ TEST(ClipboardCodecTest, RejectsUnsafeNamesAndMalformedFrames) {
 
 TEST(ClipboardCodecTest, RejectsDisallowedOrMalformedWritesBeforeOpeningClipboard) {
   DWORD sequence {};
+  EXPECT_EQ(win_clipboard::write(true, true, "Iinvalid", sequence, {}), 403);
+  EXPECT_EQ(win_clipboard::write(false, false, "Iinvalid", sequence, {}, {}, {}, true), 400);
   EXPECT_EQ(win_clipboard::write(false, true, "Tprivate", sequence, {}), 403);
   EXPECT_EQ(win_clipboard::write(true, false, "Fprivate", sequence, {}), 403);
   EXPECT_EQ(win_clipboard::write(true, true, "Tcopied", sequence, {}, std::nullopt, []() {
@@ -106,6 +124,29 @@ TEST(ClipboardCodecTest, RejectsDisallowedOrMalformedWritesBeforeOpeningClipboar
   EXPECT_EQ(win_clipboard::write(true, true, std::string("T\xff", 2), sequence, {}), 400);
   EXPECT_EQ(win_clipboard::write(true, true, std::string(win_clipboard::max_text + 2, 'T'), sequence, {}), 413);
   EXPECT_EQ(win_clipboard::write(true, true, std::string(win_clipboard::max_body + 1, 'F'), sequence, {}), 413);
+}
+
+TEST(ClipboardCodecTest, PngRoundTripPreservesBgraAndAlpha) {
+  clipboard_image::snapshot source;
+  source.width = 2;
+  source.height = 1;
+  source.stride = 8;
+  source.alpha = true;
+  source.pixels = {1, 2, 3, 64, 4, 5, 6, 255};
+  std::string packet;
+  ASSERT_EQ(clipboard_image::encode(source, packet), 200);
+  ASSERT_EQ(packet.front(), 'I');
+  HGLOBAL decoded {};
+  ASSERT_EQ(clipboard_image::decode(std::string_view(packet).substr(1), decoded), 200);
+  {
+    clipboard_image::locked_memory pixels(decoded);
+    ASSERT_NE(pixels.bytes, nullptr);
+    const auto *header = static_cast<const BITMAPV5HEADER *>(pixels.bytes);
+    EXPECT_EQ(header->bV5Width, 2);
+    EXPECT_EQ(header->bV5Height, -1);
+    EXPECT_EQ(std::memcmp(header + 1, source.pixels.data(), source.pixels.size()), 0);
+  }
+  GlobalFree(decoded);
 }
 
 TEST(FileSessionTest, BindRenewExpireAndCloseWithoutStreaming) {
@@ -247,7 +288,11 @@ TEST(ClipboardBatchTest, RejectsInvalidManifestsAndUses64BitLengths) {
   EXPECT_EQ(total, 4294967297ULL);
   entries.clear();
   total = 0;
-  EXPECT_EQ(manifest(R"([{"name":"a","size":17179869184},{"name":"b","size":1}])", entries, total), 413);
+  EXPECT_EQ(manifest(R"([{"name":"a","size":9007199254740993},{"name":"b","size":17179869185}])", entries, total), 200);
+  EXPECT_EQ(total, 9007199254740993ULL + 17179869185ULL);
+  entries.clear();
+  total = 0;
+  EXPECT_EQ(manifest(R"([{"name":"a","size":9223372036854775807},{"name":"b","size":9223372036854775807},{"name":"c","size":2}])", entries, total), 413);
 }
 
   #ifdef GTEST_HAS_DEATH_TEST
@@ -277,6 +322,43 @@ namespace {
     EXPECT_EQ(win_clipboard::publish(L"example", false, sequence, original, {}), 204);
     EXPECT_NE(sequence, original);
   }
+
+  void check_clipboard_download() {
+    const auto name = L"SunshineDownloadTest-" + std::to_wstring(GetCurrentProcessId());
+    const auto station = CreateWindowStationW(name.c_str(), 0, WINSTA_ALL_ACCESS, nullptr);
+    ASSERT_TRUE(station && SetProcessWindowStation(station));
+    const auto desktop = CreateDesktopW(L"Private", nullptr, nullptr, 0, GENERIC_ALL, nullptr);
+    ASSERT_TRUE(desktop && SetThreadDesktop(desktop));
+    const auto directory = std::filesystem::temp_directory_path() / name;
+    ASSERT_TRUE(std::filesystem::create_directory(directory));
+    const auto path = directory / L"part.bin";
+    const std::string prefix(platf::file_transfer::chunk_size, 'a');
+    ASSERT_TRUE(std::ofstream(path, std::ios::binary) << prefix << "tail");
+    auto selection = path.native();
+    selection.push_back(L'\0');
+    const DWORD original = GetClipboardSequenceNumber();
+    DWORD sequence {};
+    ASSERT_EQ(win_clipboard::publish(selection, true, sequence, original, {}), 204);
+    std::string output;
+    platf::clipboard_download_t snapshot;
+    const LUID owner {3, 7};
+    ASSERT_EQ(snapshot.begin(original, original, sequence, owner, output), 200);
+    ASSERT_FALSE(output.empty());
+    EXPECT_EQ(output.front(), 'M');
+    const auto manifest = nlohmann::json::parse(output.substr(1));
+    EXPECT_EQ(manifest.at("files").at(0).at("name"), "part.bin");
+    EXPECT_EQ(manifest.at("files").at(0).at("size"), std::to_string(prefix.size() + 4));
+    platf::clipboard_download_request_t request {"chunk", snapshot.lease, 0, 0};
+    ASSERT_EQ(snapshot.read(request, sequence, sequence, owner, output), 200);
+    EXPECT_EQ(output, prefix);
+    request.offset = prefix.size();
+    ASSERT_EQ(snapshot.read(request, sequence, sequence, owner, output), 200);
+    EXPECT_EQ(output, "tail");
+    EXPECT_EQ(snapshot.read(request, sequence, sequence + 1, owner, output), 409);
+    EXPECT_EQ(snapshot.read(request, sequence, sequence, owner, output), 409);
+    EXPECT_TRUE(std::filesystem::remove(path));
+    EXPECT_TRUE(std::filesystem::remove(directory));
+  }
 }  // namespace
 
 // Death-test subprocesses capture stderr themselves, so use the plain GoogleTest fixture.
@@ -285,6 +367,17 @@ GTEST_TEST(ClipboardPublicationDeathTest, DistinguishesBusyClipboardFromChangedR
   ASSERT_EXIT(
     {
       check_clipboard_publication();
+      std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+    },
+    ::testing::ExitedWithCode(0),
+    ""
+  );
+}
+
+GTEST_TEST(ClipboardDownloadDeathTest, ReadsPinnedChunksUntilClipboardChanges) {
+  ASSERT_EXIT(
+    {
+      check_clipboard_download();
       std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
     },
     ::testing::ExitedWithCode(0),
@@ -307,7 +400,7 @@ namespace {
     std::string lease;
     std::string task;
 
-    platf::clipboard_upload_result_t choose(const fs::path &destination, std::string_view previous = {}) {
+    platf::clipboard_upload_result_t choose(const fs::path &destination, std::string_view previous = {}, std::weak_ptr<platf::clipboard_upload_session_t> preparing_stream = {}) {
       const auto resolve = [&](auto &target) {
         target.directory = destination;
         return platf::file_transfer::pin_directory(destination, target.pins);
@@ -315,7 +408,7 @@ namespace {
       const auto permitted = [&] {
         return active;
       };
-      return cache.capture_target(cert, logon, stream, task, decltype(cache)::clock::now(), permitted, resolve, previous);
+      return cache.capture_target(cert, logon, stream, task, decltype(cache)::clock::now(), permitted, resolve, previous, preparing_stream);
     }
 
     int capture(const fs::path &destination) {
@@ -395,6 +488,27 @@ TEST(ClipboardResumeTest, DeliversInterleavedPastesToTheirCapturedFoldersWithout
   EXPECT_EQ(fs::file_size(a / L"empty"), 0U);
   EXPECT_EQ(fs::file_size(b / L"empty"), 0U);
   EXPECT_EQ(fs::remove_all(t.root), 8U);
+}
+
+TEST(ClipboardResumeTest, RetainsACapturedFolderWhileItsStreamPreparesTheUpload) {
+  resume_test_t t;
+  t.root += "-" + platf::new_file_lease();
+  ASSERT_TRUE(fs::create_directories(t.root));
+  auto stream = platf::make_clipboard_upload_session(t.cert);
+  t.task.assign(32, 'a');
+  ASSERT_EQ(t.choose(t.root, {}, stream).status, 204);
+  const auto later = decltype(t.cache)::clock::now() + std::chrono::hours(2);
+  t.cache.expire(later);
+  t.resume(0);
+  t.cache.expire(later);
+  EXPECT_EQ(t.send("resume", resume_manifest).status, 404);
+
+  t.task.assign(32, 'b');
+  ASSERT_EQ(t.choose(t.root, {}, stream).status, 204);
+  stream.reset();
+  t.cache.expire(later);
+  EXPECT_EQ(t.send("resume", resume_manifest).status, 404);
+  EXPECT_TRUE(fs::remove(t.root));
 }
 
 TEST(ClipboardResumeTest, CancelsOnlyTheAddressedPasteAndExpiresIdleFolderPins) {
@@ -558,10 +672,10 @@ TEST(ClipboardResumeTest, RebindsOnlyMatchingOwnerAndFileRevisionsAndDiscardsOnC
 
 TEST(ClipboardResumeTest, ExpiresIdleFilesAndEnforcesSharedReservation) {
   resume_test_t t;
-  t.resume(0);
-  EXPECT_EQ(t.send("chunk", "a").status, 204);
   auto huge = nlohmann::json::parse(resume_manifest);
-  huge[0]["size"] = platf::clipboard_upload::batch_limit;
+  const auto free = fs::space(t.root.parent_path()).available;
+  huge[0]["size"] = free - free / 4;
+  ASSERT_EQ(t.send("resume", huge.dump()).status, 200);
   t.cert = "paired-b";
   EXPECT_EQ(t.send("resume", huge.dump()).status, 507);
   t.cache.expire(platf::clipboard_upload::resume_cache_t::clock::now() + std::chrono::minutes(31));
