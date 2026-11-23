@@ -40,12 +40,14 @@ describe('clipboard settings', () => {
     expect(checkbox.props('default')).toBe('true')
   })
 
-  it.each(['windows', 'linux', 'macos'])('exposes text and file permissions on Windows (%s)', platform => {
+  it.each(['windows', 'linux', 'macos'])('exposes clipboard permissions on Windows (%s)', platform => {
+    const defaults = configTabs.find(tab => tab.id === 'input').options
+    expect(defaults.clipboard_images).toBe('disabled')
     const wrapper = mount(Inputs, {
-      props: { platform, config: { clipboard_text: 'disabled', clipboard_files: 'disabled' } },
+      props: { platform, config: { ...defaults } },
       global: globalOptions,
     })
-    for (const option of ['clipboard_text', 'clipboard_files', 'file_browser', 'host_power']) {
+    for (const option of ['clipboard_text', 'clipboard_images', 'clipboard_files', 'file_browser', 'host_power']) {
       expect(wrapper.find(`#${option}`).exists()).toBe(platform === 'windows')
     }
   })

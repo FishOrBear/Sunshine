@@ -44,6 +44,14 @@ namespace platf {
   /** @brief Return the clipboard sequence at stream startup without retrieving its contents. */
   std::uint32_t clipboard_sequence();
 
+  /** @brief One request for pinned files from a post-launch clipboard selection. */
+  struct clipboard_download_request_t {
+    std::string op;
+    std::uint64_t lease {};
+    std::uint32_t file {};
+    std::uint64_t offset {};
+  };
+
   /** @brief Read or replace an interactive user's clipboard under their shell token. */
-  int exchange_clipboard(clipboard::formats_t formats, bool upload, std::optional<std::uint32_t> since, std::string_view input, std::string &output, std::uint32_t &sequence, const std::function<bool()> &grant_active = {});
+  int exchange_clipboard(clipboard::formats_t formats, bool upload, std::optional<std::uint32_t> since, std::string_view input, std::string &output, std::uint32_t &sequence, const std::function<bool()> &grant_active = {}, const clipboard_download_request_t &download = {});
 }  // namespace platf

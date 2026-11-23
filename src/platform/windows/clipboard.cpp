@@ -4,6 +4,7 @@
  */
 #include "clipboard.h"
 
+#include "clipboard_download.h"
 #include "clipboard_resume.h"
 #include "clipboard_upload.h"
 #include "clipboard_win32.h"
@@ -15,7 +16,8 @@
 namespace platf {
 
   /** @brief Pending and most recently committed batches belong only to this stream. */
-  struct clipboard_upload_session_t {
+  struct clipboard_upload_session_t: std::enable_shared_from_this<clipboard_upload_session_t> {
+    clipboard_download_t download;  ///< Read-only clipboard snapshot for this stream.
     std::string cert;  ///< Verified TLS identity that negotiated this stream.
     std::uint64_t serial {};  ///< Issuance order of streams competing for the same upload.
     bool resumable {};  ///< Current batch uses the reconnect cache.
@@ -31,8 +33,25 @@ namespace platf {
     return cache;
   }
 
+  static std::mutex download_sessions_mutex;
+  static std::vector<std::weak_ptr<clipboard_upload_session_t>> download_sessions;
+
   void expire_clipboard_uploads() {
-    resume_cache().expire(std::chrono::steady_clock::now());
+    const auto now = std::chrono::steady_clock::now();
+    resume_cache().expire(now);
+    std::lock_guard sessions_lock(download_sessions_mutex);
+    std::erase_if(download_sessions, [&](const auto &weak) {
+      const auto session = weak.lock();
+      if (!session) {
+        return true;
+      }
+      auto &snapshot = session->download;
+      std::unique_lock snapshot_lock(snapshot.mutex, std::try_to_lock);
+      if (snapshot_lock && !snapshot.files.empty() && now - snapshot.last_read > std::chrono::minutes(2)) {
+        snapshot.files.clear();
+      }
+      return false;
+    });
   }
 
   std::shared_ptr<clipboard_upload_session_t> make_clipboard_upload_session(std::string cert) {
@@ -40,6 +59,8 @@ namespace platf {
     auto session = std::make_shared<clipboard_upload_session_t>();
     session->cert = std::move(cert);
     session->serial = ++serial;
+    std::lock_guard lock(download_sessions_mutex);
+    download_sessions.emplace_back(session);
     return session;
   }
 
@@ -78,7 +99,7 @@ namespace platf {
         const auto capture = [&](auto &target) {
           return clipboard_upload::capture_paste_target(user.token, target);
         };
-        return resume_cache().capture_target(session.cert, stats.AuthenticationId, session.serial, task, clipboard_upload::resume_cache_t::clock::now(), permitted, capture, previous);
+        return resume_cache().capture_target(session.cert, stats.AuthenticationId, session.serial, task, clipboard_upload::resume_cache_t::clock::now(), permitted, capture, previous, session.weak_from_this());
       }
       return resume_cache().exchange({}, session.cert, stats.AuthenticationId, session.serial, op, id, file, offset, since, input, permitted, task);
     }
@@ -174,7 +195,7 @@ namespace platf {
     return GetClipboardSequenceNumber();
   }
 
-  int exchange_clipboard(clipboard::formats_t formats, bool upload, std::optional<std::uint32_t> since, std::string_view input, std::string &output, std::uint32_t &sequence, const std::function<bool()> &grant_active) {
+  int exchange_clipboard(clipboard::formats_t formats, bool upload, std::optional<std::uint32_t> since, std::string_view input, std::string &output, std::uint32_t &sequence, const std::function<bool()> &grant_active, const clipboard_download_request_t &download) {
     // Report the stream-start revision even when the user copied something before the first poll.
     if (!upload && !since) {
       output.clear();
@@ -187,6 +208,26 @@ namespace platf {
     }
     DWORD current = GetClipboardSequenceNumber();
     sequence = current;
+    if (!download.op.empty()) {
+      if (upload || !since || !formats.files || !formats.upload_session) {
+        return 403;
+      }
+      TOKEN_STATISTICS stats {};
+      DWORD needed {};
+      if (!GetTokenInformation(user.token, TokenStatistics, &stats, sizeof(stats), &needed)) {
+        return 403;
+      }
+      auto &snapshot = formats.upload_session->download;
+      std::lock_guard lock(snapshot.mutex);
+      if (download.op != "1") {
+        return snapshot.read(download, *since, GetClipboardSequenceNumber(), stats.AuthenticationId, output);
+      }
+      auto status = snapshot.begin(*since, formats.initial_sequence, current, stats.AuthenticationId, output);
+      sequence = current;
+      if (status) {
+        return *status;
+      }
+    }
     if (!upload && !formats.should_read(current, since)) {
       return 204;
     }
@@ -199,9 +240,14 @@ namespace platf {
           return 500;
         }
       }
-      status = win_clipboard::write(formats.text, formats.files, input, current, staging, since, grant_active);
+      status = win_clipboard::write(formats.text, formats.files, input, current, staging, since, grant_active, formats.images);
     } else {
-      status = win_clipboard::read(formats.text, formats.files, *since, output, current);
+      const auto inspected = current;
+      status = win_clipboard::read(formats.text, formats.files && download.op.empty(), *since, output, current, formats.images);
+      if (!download.op.empty() && inspected != current) {
+        output.clear();
+        status = 409;
+      }
       if (status == 200 && current == formats.initial_sequence) {
         output.clear();
         status = 204;

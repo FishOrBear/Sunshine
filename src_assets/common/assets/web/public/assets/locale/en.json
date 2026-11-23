@@ -346,6 +346,8 @@
     "motion_as_ds4_desc": "If disabled, motion sensors will not be taken into account during gamepad type selection.",
     "mouse": "Enable Mouse Input",
     "mouse_desc": "Allows guests to control the host system with the mouse",
+    "clipboard_images": "Sync clipboard images",
+    "clipboard_images_desc": "Exchange newly copied images with paired clients that have image sync enabled.",
     "clipboard_text": "Sync clipboard text",
     "clipboard_text_desc": "Allow paired clients to exchange newly copied text during a stream. The client must also enable text sync.",
     "host_power": "Allow remote shutdown and restart",

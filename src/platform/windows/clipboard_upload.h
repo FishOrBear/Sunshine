@@ -12,7 +12,6 @@
 namespace platf::clipboard_upload {
   namespace fs = std::filesystem;
   using win_clipboard::detail::file_handle;
-  constexpr std::uint64_t batch_limit = 16ULL << 30;  ///< Maximum data accepted in a single paste.
   constexpr std::size_t chunk_limit = 4U << 20;  ///< Maximum body for one append.
 
   /** @brief Describe one file before accepting any payload bytes. */
@@ -60,7 +59,8 @@ namespace platf::clipboard_upload {
         return 400;
       }
       const auto size = item["size"].get<std::uint64_t>();
-      if (size > batch_limit - total) {
+      // Windows file offsets are signed 64-bit; the batch byte count is unsigned.
+      if (size > INT64_MAX || size > UINT64_MAX - total) {
         return 413;
       }
       total += size;

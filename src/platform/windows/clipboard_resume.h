@@ -24,7 +24,7 @@ namespace platf::clipboard_upload {
     }
 
     /** @brief Bind a paste gesture once to its foreground target before accepting content or a filename. */
-    clipboard_upload_result_t capture_target(std::string_view cert, LUID logon, std::uint64_t stream, std::string_view task, clock::time_point now, const std::function<bool()> &active, const std::function<int(paste_target_t &)> &capture, std::string_view previous = {}) {
+    clipboard_upload_result_t capture_target(std::string_view cert, LUID logon, std::uint64_t stream, std::string_view task, clock::time_point now, const std::function<bool()> &active, const std::function<int(paste_target_t &)> &capture, std::string_view previous = {}, std::weak_ptr<clipboard_upload_session_t> preparing_stream = {}) {
       if (cert.empty() || !stream || !active()) {
         return {403};
       }
@@ -48,6 +48,7 @@ namespace platf::clipboard_upload {
             found->lease.clear();
             found->stream = stream;
           }
+          found->preparing_stream = preparing_stream;
           found->touched = now;
           return {204, {}, {}, {}, {}, found->task};
         }
@@ -63,6 +64,7 @@ namespace platf::clipboard_upload {
         record.cert = cert;
         record.logon = logon;
         record.stream = stream;
+        record.preparing_stream = preparing_stream;
         record.task = task;
         record.touched = now;
         record.target = target;
@@ -93,6 +95,7 @@ namespace platf::clipboard_upload {
         if (prior != records.end() && !prior->capturing && prior->stream < stream && identity && prior->folder == identity && CompareStringOrdinal(target->directory.c_str(), -1, prior->folder_path.c_str(), -1, TRUE) == CSTR_EQUAL) {
           prior->gesture = task;
           prior->stream = stream;
+          prior->preparing_stream = preparing_stream;
           prior->lease.clear();
           prior->touched = now;
           clipboard_upload_result_t chosen {204, {}, {}, {}, {}, prior->task};
@@ -159,6 +162,7 @@ namespace platf::clipboard_upload {
       if (op == "chunk" && !batch.published) {
         const auto status = batch.append(file, offset, input);
         if (status == 204) {
+          found->reserved -= input.size();
           found->touched = now;
           return {204, {}, batch.entries[file].received};
         }
@@ -177,7 +181,6 @@ namespace platf::clipboard_upload {
           if (status != 204) {
             return {status};
           }
-          found->reserved = 0;
           found->target.reset();
         }
         found->touched = now;
@@ -197,7 +200,6 @@ namespace platf::clipboard_upload {
       if (status == 204) {
         found->touched = now;
         found->revision = revision;
-        found->reserved = 0;
         return {204, {}, {}, revision};
       }
       if (status == 423) {
@@ -215,8 +217,10 @@ namespace platf::clipboard_upload {
       std::string cert;  ///< Authenticated client certificate.
       LUID logon {};  ///< Local Windows authentication session.
       std::unique_ptr<batch_t> batch;  ///< Manifest and verified file contents.
-      std::uint64_t reserved {};  ///< Bytes promised to this unfinished batch.
+      DWORD volume_serial {};  ///< Destination volume of the staged files.
+      std::uint64_t reserved {};  ///< Bytes still to be written on that volume.
       std::uint64_t stream {};  ///< Most recent stream that acquired the lease.
+      std::weak_ptr<clipboard_upload_session_t> preparing_stream;  ///< Stream that captured the folder before the client queued or hashed its files.
       std::string lease;  ///< Random identifier rotated by every resume.
       clock::time_point touched;  ///< Last successful contact for expiry.
       DWORD revision {};  ///< Clipboard revision of a committed receipt.
@@ -318,14 +322,19 @@ namespace platf::clipboard_upload {
         return {409, {}, {}, {}, "manifest"};
       }
       if (!matches || (!direct && found->batch->published && GetClipboardSequenceNumber() != found->revision)) {
+        const auto &destination = direct ? found->target->directory : root;
+        DWORD volume {};
+        if (!GetVolumeInformationW(destination.root_path().c_str(), nullptr, 0, &volume, nullptr, nullptr, nullptr, 0)) {
+          return {500};
+        }
         std::uint64_t reservation = total;
         for (auto it = records.begin(); it != records.end(); ++it) {
-          if (it != found) {
+          if (it != found && it->volume_serial == volume) {
+            if (it->reserved > UINT64_MAX - reservation) {
+              return {507};
+            }
             reservation += it->reserved;
           }
-        }
-        if (reservation > batch_limit) {
-          return {507};
         }
         const bool create = found == records.end();
         if ((create || (found->batch && found->batch->published)) && !make_room(create)) {
@@ -334,7 +343,7 @@ namespace platf::clipboard_upload {
         if (!direct) {
           remove_abandoned_directories(root);
         }
-        const auto created = direct ? batch->stage_for_delivery(found->target->directory, total) : batch->stage(root, total);
+        const auto created = direct ? batch->stage_for_delivery(destination, reservation) : batch->stage(destination, reservation);
         if (created != 200) {
           return {created};
         }
@@ -345,6 +354,7 @@ namespace platf::clipboard_upload {
         found->cert = cert;
         found->logon = logon;
         found->batch = std::move(batch);
+        found->volume_serial = volume;
         found->reserved = total;
       }
       found->stream = stream;
@@ -364,7 +374,7 @@ namespace platf::clipboard_upload {
     /** @brief Drop file handles whose last successful transfer predates the retention window. */
     void expire_locked(clock::time_point now) {
       std::erase_if(records, [&](const auto &record) {
-        return now - record.touched >= lifetime;
+        return now - record.touched >= lifetime && (record.batch || record.preparing_stream.expired());
       });
     }
 

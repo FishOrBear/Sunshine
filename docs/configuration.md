@@ -732,9 +732,13 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
 
 On Windows, set `clipboard_text = enabled` to exchange newly copied plain text with a paired Moonlight client during a stream. Enable text sync in the client as well. The default is `disabled`. Each text item can contain up to 1 MiB of UTF-8 text.
 
+### clipboard_images
+
+On Windows, set `clipboard_images = enabled` and enable image sync in Moonlight to copy screenshots and other clipboard bitmaps in either direction. Both peers must support image sync. The default is `disabled`. Images use lossless PNG, with a limit of 64 MiB per encoded packet and 67,108,864 pixels per decoded image.
+
 ### clipboard_files
 
-On Windows, enable clipboard file transfer on both Sunshine and the paired Moonlight client. Each paste supports up to 32 regular local files. Automatic clipboard sync supports up to 16 MiB per copy. With a compatible Windows client, pressing Ctrl+V in the stream uploads files over HTTPS in chunks, up to 16 GiB per paste. In a local Explorer folder or on the Windows desktop, each paste captures its destination. You can paste a second selection in another folder while the first transfer continues. Sunshine verifies the file contents before delivery and preserves existing files with the same name.
+On Windows, enable clipboard file transfer on both Sunshine and the paired Moonlight client. Each paste supports up to 32 regular local files. Matching Windows peers transfer file data over HTTPS in chunks in both directions, up to the space available on disk and filesystem limits. After copying on Sunshine, wait for the selection to finish downloading before pasting in local Explorer. Press Ctrl+V in the stream to upload a local selection. Older peers retain their original transfer limits. In a local Explorer folder or on the Windows desktop, each paste captures its destination. You can paste a second selection in another folder while the first transfer continues. Sunshine verifies the file contents before delivery and preserves existing files with the same name.
 
 To resume after disconnection, reconnect and paste the same unchanged selection in the original destination. Pasting into a different folder starts a new transfer there. Sunshine retains unfinished transfers for up to 30 minutes of inactivity while it is running. Cancelling an individual transfer releases its partial files. The default is `disabled`.
 
