@@ -128,6 +128,38 @@ TEST_F(ClientAuthorizationTest, PowerRequiresHostOptInAndCurrentExactEnabledCert
   EXPECT_FALSE(nvhttp::test_support::client_may_control_host_power(creds.x509));
   config::nvhttp.host_power = original;
 }
+
+/** @brief Locking requires a valid empty POST from an authorized streaming client. */
+TEST_F(ClientAuthorizationTest, HostLockRejectsInvalidRequestsAndReportsWindowsResult) {
+  using nvhttp::test_support::request_host_lock;
+  EXPECT_EQ(request_host_lock(0, "", 0, true, true), 400);
+  EXPECT_EQ(request_host_lock(2, "1", 0, true, true), 400);
+  EXPECT_EQ(request_host_lock(1, "0", 0, true, true), 400);
+  EXPECT_EQ(request_host_lock(1, "1", 1, true, true), 400);
+  EXPECT_EQ(request_host_lock(1, "1", 0, false, true), 403);
+  EXPECT_EQ(request_host_lock(1, "1", 0, true, false), 503);
+  EXPECT_EQ(request_host_lock(1, "1", 0, true, true), 202);
+}
+
+/** @brief Only valid authorized requests can read or set the playback mute state. */
+TEST_F(ClientAuthorizationTest, HostMuteReportsActualStateAndRejectsInvalidRequests) {
+  using nvhttp::test_support::request_host_mute;
+  std::optional<bool> muted = false;
+  EXPECT_EQ(request_host_mute(0, "1", 0, 1, "mute", true, muted).first, 400);
+  EXPECT_EQ(request_host_mute(1, "0", 0, 1, "mute", true, muted).first, 400);
+  EXPECT_EQ(request_host_mute(1, "1", 1, 1, "mute", true, muted).first, 400);
+  EXPECT_EQ(request_host_mute(1, "1", 0, 2, "mute", true, muted).first, 400);
+  EXPECT_EQ(request_host_mute(1, "1", 0, 1, "toggle", true, muted).first, 400);
+  EXPECT_EQ(request_host_mute(1, "1", 0, 1, "mute", false, muted).first, 403);
+  EXPECT_EQ(request_host_mute(1, "1", 0, 1, "get", true, muted), (std::pair<int, std::optional<bool>> {200, false}));
+  for (int repeat = 0; repeat < 2; ++repeat) {
+    EXPECT_EQ(request_host_mute(1, "1", 0, 1, "mute", true, muted), (std::pair<int, std::optional<bool>> {200, true}));
+  }
+  EXPECT_EQ(request_host_mute(1, "1", 0, 1, "get", true, muted).second, true);
+  EXPECT_EQ(request_host_mute(1, "1", 0, 1, "unmute", true, muted).second, false);
+  muted.reset();
+  EXPECT_EQ(request_host_mute(1, "1", 0, 1, "get", true, muted), (std::pair<int, std::optional<bool>> {503, std::nullopt}));
+}
 #endif
 
 TEST_F(ClientAuthorizationTest, DerivedLeafDoesNotInheritPairedAuthorization) {

@@ -42,12 +42,12 @@ namespace stream {
 /** @brief A lock request survives its client and expires when the final overlapping stream finishes. */
 TEST(StreamActivityTests, LocksOnlyAfterTheLastOverlappingClient) {
   stream::session::activity_t sessions;
-  EXPECT_TRUE(sessions.start(true));
-  EXPECT_FALSE(sessions.start(false));
-  EXPECT_EQ(sessions.finish(), std::nullopt);
-  EXPECT_EQ(sessions.finish(), std::optional {true});
-  EXPECT_TRUE(sessions.start(false));
-  EXPECT_EQ(sessions.finish(), std::optional {false});
+  EXPECT_TRUE(sessions.start());
+  EXPECT_FALSE(sessions.start());
+  EXPECT_EQ(sessions.finish(true), std::nullopt);
+  EXPECT_EQ(sessions.finish(false), std::optional {true});
+  EXPECT_TRUE(sessions.start());
+  EXPECT_EQ(sessions.finish(false), std::optional {false});
 }
 
 /**

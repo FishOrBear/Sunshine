@@ -746,6 +746,8 @@ To resume an interrupted upload from Moonlight to Sunshine, reconnect and paste 
 
 On Windows, paired Moonlight clients can browse local drives and transfer files by default. Choose **File transfer** on the Moonlight device card to open a dedicated file connection, or open the file browser during a stream. Files are accessed with the signed-in user's permissions. To turn this off, clear **Browse and transfer files** in the Input tab of Configuration or set `file_browser = disabled`. Reconnect after changing the setting. Sunshine keeps an interrupted resumable upload for 30 minutes of inactivity while it is running. Reconnect with the same paired client and Windows logon to continue. Both peers verify SHA-256 before publishing the destination file. When a destination already exists, a compatible client can skip it, keep both copies or request replacement of the selected version.
 
+While the signed-in Windows session is connected and locked, a paired client can open the file browser, browse folders and start uploads and downloads. This includes files queued in a folder transfer. Dragging to or from Explorer and direct deletion require the user's desktop.
+
 ### file_browser_delete
 
 On Windows, **Allow file deletion** in the Input tab controls permanent deletion and replacement of existing host files by paired clients with file browsing access. The default is `enabled`. Set `file_browser_delete = disabled` to keep browsing and transfers to new names available while disabling deletion and replacement. When replacement is allowed, Sunshine verifies the selected destination version again at publication. If the destination changed in the meantime, the transfer reports a conflict.
@@ -1215,7 +1217,8 @@ On Windows, enabled paired Moonlight clients can request a shutdown or restart o
     </tr>
     <tr>
         <td>privacy_screen</td>
-        <td>Windows only. Install an indirect virtual display and set <code>output_name</code> to its device ID from the Sunshine log.
+        <td>Windows only. Connect a supported virtual display and set <code>output_name</code> to its device ID from the Sunshine log.
+            Sunshine accepts Windows indirect virtual outputs and verifies Parsec VDD outputs by their Windows adapter hardware ID.
             Sunshine disables the physical outputs and checks that the virtual display is the only active output before streaming.
             If Windows reports the selected target as a physical display, Sunshine rejects the stream.
             Sunshine checks the topology during streaming and ends the session if a physical output becomes active.

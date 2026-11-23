@@ -979,6 +979,15 @@ namespace platf {
    */
   std::unique_ptr<audio_control_t> audio_control();
 
+#ifdef _WIN32
+  /**
+   * @brief Read or set mute on the current Windows default playback endpoint.
+   * @param desired Mute to apply, or no value for a read-only request.
+   * @return The observed mute state, or no value if the endpoint operation failed.
+   */
+  std::optional<bool> host_audio_mute(std::optional<bool> desired);
+#endif
+
   /**
    * @brief Get the display_t instance for the given hwdevice_type.
    * If display_name is empty, use the first monitor that's compatible you can find
@@ -1052,8 +1061,9 @@ namespace platf {
 #ifdef _WIN32
   /**
    * @brief Ask Windows to lock the interactive desktop hosting the stream.
+   * @return True when Windows accepted the request.
    */
-  void lock_workstation();
+  bool lock_workstation();
 #endif
 
   void restart();

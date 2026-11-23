@@ -135,7 +135,7 @@ namespace platf {
     return 200;
   }
 
-  clipboard_upload_result_t exchange_clipboard_batch(clipboard_upload_session_t &session, std::string_view op, std::string_view id, std::uint32_t file, std::uint64_t offset, std::optional<std::uint32_t> since, std::string_view input, const std::function<bool()> &grant_active, std::string_view task, std::string_view previous) {
+  clipboard_upload_result_t exchange_clipboard_batch(clipboard_upload_session_t &session, std::string_view op, std::string_view id, std::uint32_t file, std::uint64_t offset, std::optional<std::uint32_t> since, std::string_view input, const std::function<bool()> &grant_active, std::string_view task, std::string_view previous, bool allow_replace) {
     desktop::shell_impersonation_t user;
     if (!user.begin()) {
       return {409, {}, {}, {}, "shell"};
@@ -161,7 +161,7 @@ namespace platf {
         };
         return resume_cache().capture_target(session.cert, stats.AuthenticationId, session.serial, task, clipboard_upload::resume_cache_t::clock::now(), permitted, capture, previous, session.weak_from_this());
       }
-      return resume_cache().exchange({}, session.cert, stats.AuthenticationId, session.serial, op, id, file, offset, since, input, permitted, task);
+      return resume_cache().exchange({}, session.cert, stats.AuthenticationId, session.serial, op, id, file, offset, since, input, permitted, task, allow_replace);
     }
     std::lock_guard lock(session.mutex);
     if (!grant_active()) {
@@ -297,7 +297,7 @@ namespace platf {
       if (download.op != "1") {
         return snapshot.read(download, *since, GetClipboardSequenceNumber(), stats.AuthenticationId, output);
       }
-      auto status = snapshot.begin(*since, formats.initial_sequence, current, stats.AuthenticationId, output, download.metadata_only);
+      auto status = snapshot.begin(*since, formats.initial_sequence, current, stats.AuthenticationId, output, download.metadata_only, download.folders);
       // On some Windows desktops SYSTEM sees the revision but no formats,
       // even while impersonating Explorer. Query that revision in the shell
       // user's process context. File handles are still opened under impersonation.
@@ -308,7 +308,7 @@ namespace platf {
           if (!desktop::on_user_desktop() || (grant_active && !grant_active()) || current != GetClipboardSequenceNumber()) {
             return 409;
           }
-          status = snapshot.pin(paths, current, stats.AuthenticationId, output, download.metadata_only);
+          status = snapshot.pin(paths, current, stats.AuthenticationId, output, download.metadata_only, download.folders);
         } else if (read != 204) {
           status = read;
         }

@@ -456,6 +456,10 @@ namespace nvhttp {
   #ifdef _WIN32
     /** @brief Check current host opt-in and certificate enablement for power requests. */
     bool client_may_control_host_power(const std::string &cert);
+    /** @brief Exercise lock request validation and status handling with a simulated workstation. */
+    int request_host_lock(std::size_t header_count, std::string_view header, std::size_t body_size, bool authorized, bool accepted);
+    /** @brief Exercise mute request validation and the observed state without touching the audio device. */
+    std::pair<int, std::optional<bool>> request_host_mute(std::size_t header_count, std::string_view header, std::size_t body_size, std::size_t action_count, std::string_view action, bool authorized, std::optional<bool> &device_state);
     /** @brief Exercise the file-only open/close permissions without starting a listener or stream. */
     int change_file_connection(const std::string &cert, const std::string &token, bool close);
     /** @brief Resolve the file data path using its actual grant and pairing checks. */

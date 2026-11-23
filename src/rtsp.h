@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 
 // local includes
 #include "clipboard.h"
@@ -85,6 +86,7 @@ namespace rtsp_stream {
 
     bool host_audio;  ///< Whether host audio should be played locally.
     bool lock_on_disconnect {};  ///< Request to lock Windows when the last overlapping session disconnects.
+    bool privacy_screen {};  ///< Require an exclusive virtual display for this stream.
     std::string unique_id;  ///< Moonlight client unique identifier for this launch request.
     int width;  ///< Frame or display width in pixels.
     int height;  ///< Frame or display height in pixels.
@@ -128,6 +130,19 @@ namespace rtsp_stream {
    * @return Count of active sessions.
    */
   int session_count();
+
+  /**
+   * @brief Check whether the given paired client has a running stream.
+   * @param cert Client certificate in PEM format.
+   * @return True when a running stream belongs to this certificate.
+   */
+  bool has_running_session(std::string_view cert);
+
+  /** @brief Update the disconnect policy only for the specified stream of this paired client. */
+  std::optional<bool> update_disconnect_lock(std::string_view cert, std::string_view id, bool enabled);
+
+  /** @brief Check whether an active stream requires exclusive virtual display topology. */
+  bool has_private_session();
 
   /** @brief Retrieve allowed formats for the authenticated owner of a running stream. */
   clipboard::formats_t clipboard_formats(std::string_view cert, std::string_view token);

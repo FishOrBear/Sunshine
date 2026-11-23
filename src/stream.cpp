@@ -503,6 +503,7 @@ namespace stream {
    */
   struct session_t {
     bool lock_on_disconnect {};  ///< Lock requested by this session or by the host.
+    bool privacy_screen {};  ///< Whether this session required a private display.
     config_t config;  ///< Stream or encoder configuration captured for the worker.
 
     safe::mail_t mail;  ///< Mailbox used to distribute packets and lifecycle events.
@@ -2281,6 +2282,22 @@ namespace stream {
       return session.client_cert;
     }
 
+    bool requires_privacy(const session_t &session) {
+      return session.privacy_screen;
+    }
+
+    std::optional<bool> update_disconnect_lock(session_t &session, std::string_view id, bool enabled) {
+      if (id != std::to_string(session.launch_session_id)) {
+        return std::nullopt;
+      }
+      std::lock_guard lock {lifecycle_mutex};
+      if (state(session) != state_e::RUNNING) {
+        return std::nullopt;
+      }
+      session.lock_on_disconnect = config::video.dd.lock_on_disconnect || enabled;
+      return session.lock_on_disconnect;
+    }
+
     const clipboard::grant_t &clipboard_grant(const session_t &session) {
       return session.clipboard_grant;
     }
@@ -2329,13 +2346,13 @@ namespace stream {
 
       // If this is the last session, invoke the platform callbacks
       std::lock_guard lock {lifecycle_mutex};
-      if (const auto lock_requested = activity.finish(); lock_requested.has_value()) {
+      if (const auto lock_requested = activity.finish(session.lock_on_disconnect); lock_requested.has_value()) {
 #ifdef _WIN32
         if (*lock_requested) {
           platf::lock_workstation();
         }
 #endif
-        bool revert_display_config {config::video.dd.config_revert_on_disconnect || config::video.dd.configuration_option == config::video_t::dd_t::config_option_e::privacy_screen};
+        bool revert_display_config {config::video.dd.config_revert_on_disconnect || session.privacy_screen};
         if (proc::proc.running()) {
 #if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
           system_tray::update_tray_pausing(proc::proc.get_last_run_app_name());
@@ -2397,7 +2414,7 @@ namespace stream {
       session.state.store(state_e::RUNNING, std::memory_order_release);
 
       // If this is the first session, invoke the platform callbacks
-      if (activity.start(session.lock_on_disconnect)) {
+      if (activity.start()) {
         platf::streaming_will_start();
 #if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
         system_tray::update_tray_playing(proc::proc.get_last_run_app_name());
@@ -2418,6 +2435,7 @@ namespace stream {
       session->shutdown_event = mail->event<bool>(mail::shutdown);
       session->launch_session_id = launch_session.id;
       session->lock_on_disconnect = launch_session.lock_on_disconnect;
+      session->privacy_screen = launch_session.privacy_screen;
       session->clipboard_grant = launch_session.clipboard_grant;
       session->client_cert = launch_session.client_cert;
       session->input_session_id = launch_session.client_cert.empty() ? launch_session.unique_id : launch_session.client_cert;

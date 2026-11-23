@@ -114,7 +114,7 @@ namespace platf::clipboard_upload {
     }
 
     /** @brief Apply one operation after the caller validates this stream and its interactive desktop. */
-    clipboard_upload_result_t exchange(const fs::path &root, std::string_view cert, LUID logon, std::uint64_t stream, std::string_view op, std::string_view id, std::uint32_t file, std::uint64_t offset, std::optional<std::uint32_t> since, std::string_view input, const std::function<bool()> &active, std::string_view task = {}) {
+    clipboard_upload_result_t exchange(const fs::path &root, std::string_view cert, LUID logon, std::uint64_t stream, std::string_view op, std::string_view id, std::uint32_t file, std::uint64_t offset, std::optional<std::uint32_t> since, std::string_view input, const std::function<bool()> &active, std::string_view task = {}, bool allow_replace = false) {
       if (cert.empty() || !stream) {
         return {403};
       }
@@ -148,8 +148,8 @@ namespace platf::clipboard_upload {
           return {409, {}, {}, {}, "busy"};
         }
       }
-      if (op == "resume" || op == "discard") {
-        return id.empty() ? bind(root, cert, logon, stream, op == "discard", input, found, now) : clipboard_upload_result_t {400};
+      if (op == "resume" || op == "discard" || op == "prepare") {
+        return id.empty() && (op != "prepare" || !task.empty()) ? bind(root, cert, logon, stream, op, input, found, now, allow_replace) : clipboard_upload_result_t {400};
       }
       if (found == records.end() || !found->batch || found->lease != id || found->stream != stream || id.empty()) {
         return {404};
@@ -175,11 +175,17 @@ namespace platf::clipboard_upload {
         }
         return {status};
       }
-      if (op == "deliver" && !task.empty() && input.empty()) {
+      if (op == "deliver" && !task.empty()) {
+        if (!batch.interactive && !input.empty()) {
+          return {400};
+        }
         if (!batch.published) {
-          const auto status = batch.deliver(found->target->directory, active);
-          if (status != 204) {
-            return {status};
+          const auto result = batch.deliver(found->target->directory, active, allow_replace, input);
+          if (result.status != 204) {
+            if (result.conflict == "file") {
+              found->touched = now;
+            }
+            return result;
           }
           found->target.reset();
         }
@@ -293,10 +299,11 @@ namespace platf::clipboard_upload {
     }
 
     /** @brief Bind a new stream lease to a verified manifest or discard its unfinished files. */
-    clipboard_upload_result_t bind(const fs::path &root, std::string_view cert, LUID logon, std::uint64_t stream, bool discard, std::string_view input, std::vector<record_t>::iterator found, clock::time_point now) {
+    clipboard_upload_result_t bind(const fs::path &root, std::string_view cert, LUID logon, std::uint64_t stream, std::string_view op, std::string_view input, std::vector<record_t>::iterator found, clock::time_point now, bool allow_replace) {
       auto batch = std::make_unique<batch_t>();
       std::uint64_t total {};
-      const auto status = manifest(input, batch->entries, total, true);
+      batch->interactive = op == "prepare";
+      const auto status = manifest(input, batch->entries, total, true, batch->interactive);
       if (status != 200) {
         return {status};
       }
@@ -306,9 +313,9 @@ namespace platf::clipboard_upload {
       }
       const bool direct = found != records.end() && !found->task.empty();
       const bool matches = found != records.end() && found->batch && std::ranges::equal(batch->entries, found->batch->entries, [](const auto &a, const auto &b) {
-                             return a.name == b.name && a.size == b.size && a.sha256 == b.sha256;
+                             return a.name == b.name && a.directory == b.directory && a.size == b.size && a.sha256 == b.sha256;
                            });
-      if (discard) {
+      if (op == "discard") {
         if (matches) {
           records.erase(found);
         }
@@ -323,6 +330,31 @@ namespace platf::clipboard_upload {
       }
       if (!matches || (!direct && found->batch->published && GetClipboardSequenceNumber() != found->revision)) {
         const auto &destination = direct ? found->target->directory : root;
+        if (batch->interactive) {
+          found->touched = now;
+          auto conflicts = nlohmann::json::array();
+          for (size_t index = 0; index < batch->entries.size(); ++index) {
+            const auto &entry = batch->entries[index];
+            nlohmann::json conflict;
+            const auto status = batch->inspect_conflict(index, destination / entry.name, allow_replace, conflict);
+            if (!conflict.is_null()) {
+              conflicts.push_back(std::move(conflict));
+            } else if (status != 200) {
+              return {status};
+            }
+            if (entry.resolution == "skip") {
+              total -= entry.size;
+            }
+          }
+          if (!conflicts.empty()) {
+            // Older clients resolve the first collision and retry the manifest.
+            auto response = conflicts.front();
+            if (conflicts.size() > 1) {
+              response["conflicts"] = std::move(conflicts);
+            }
+            return {409, response.dump(), {}, {}, "file"};
+          }
+        }
         DWORD volume {};
         if (!GetVolumeInformationW(destination.root_path().c_str(), nullptr, 0, &volume, nullptr, nullptr, nullptr, 0)) {
           return {500};
@@ -358,15 +390,26 @@ namespace platf::clipboard_upload {
         found->reserved = total;
       }
       found->stream = stream;
+      if (op == "prepare") {
+        found->batch->interactive = true;
+      }
       found->lease = std::move(lease);
       found->touched = now;
       nlohmann::json offsets = nlohmann::json::array();
-      for (const auto &entry : found->batch->entries) {
+      nlohmann::json skipped = nlohmann::json::array();
+      for (size_t i = 0; i < found->batch->entries.size(); ++i) {
+        const auto &entry = found->batch->entries[i];
         offsets.push_back(entry.received);
+        if (entry.resolution == "skip") {
+          skipped.push_back(i);
+        }
       }
       nlohmann::json response {{"id", found->lease}, {"offsets", std::move(offsets)}};
       if (direct) {
         response["committed"] = found->batch->published;
+        if (found->batch->interactive) {
+          response["skipped"] = std::move(skipped);
+        }
       }
       return {200, response.dump()};
     }

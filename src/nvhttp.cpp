@@ -515,6 +515,7 @@ namespace nvhttp {
         tree.put("root.clipboardbatchversion", grant.formats.resumable ? 2 : 1);
         if (grant.formats.resumable) {
           tree.put("root.clipboardmultitask", 1);
+          tree.put("root.clipboardpasteconflicts", 1);
         }
       }
     }
@@ -539,6 +540,8 @@ namespace nvhttp {
 #ifdef _WIN32
     launch_session->lock_on_disconnect = config::video.dd.lock_on_disconnect || get_arg(args, "lockOnDisconnect", "0") == "1";
 #endif
+    launch_session->privacy_screen = config::video.dd.configuration_option == config::video_t::dd_t::config_option_e::privacy_screen ||
+                                     get_arg(args, "privacyScreen", "0") == "1";
     auto mode = std::stringstream(get_arg(args, "mode", "0x0x0"));
     // Split mode by the char "x", to populate width/height/fps
     int x = 0;
@@ -1336,6 +1339,11 @@ namespace nvhttp {
     tree.put("root.HttpsPort", net::map_port(PORT_HTTPS));
     tree.put("root.ExternalPort", net::map_port(PORT_HTTP));
     tree.put("root.MaxLumaPixelsHEVC", video::active_hevc_mode > 1 ? "1869449984" : "0");
+#ifdef _WIN32
+    if constexpr (std::is_same_v<SunshineHTTPS, T>) {
+      tree.put("root.privacyscreenversion", 1);
+    }
+#endif
 
     // Only include the MAC address for requests sent from paired clients over HTTPS.
     // For HTTP requests, use a placeholder MAC address that Moonlight knows to ignore.
@@ -1496,17 +1504,25 @@ namespace nvhttp {
     host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
     auto launch_session = make_launch_session(host_audio, args, identity);
 
-    if (rtsp_stream::session_count() == 0) {
+    const bool no_active_sessions = rtsp_stream::session_count() == 0;
+    if (!no_active_sessions && config::video.dd.configuration_option != config::video_t::dd_t::config_option_e::privacy_screen && (launch_session->privacy_screen || rtsp_stream::has_private_session())) {
+      tree.put("root.gamesession", 0);
+      tree.put("root.<xmlattr>.status_code", 409);
+      tree.put("root.<xmlattr>.status_message", "Privacy screen requires an exclusive streaming session");
+      return;
+    }
+    if (no_active_sessions) {
       // The display should be restored in case something fails as there are no other sessions.
       revert_display_configuration = true;
 
       // We want to prepare display only if there are no active sessions at
       // the moment. This should be done before probing encoders as it could
       // change the active displays.
-      if (!display_device::configure_display(config::video, *launch_session)) {
+      using enum display_device::configuration_result_e;
+      if (const auto result = display_device::configure_display(config::video, *launch_session); result != ready) {
         tree.put("root.gamesession", 0);
         tree.put("root.<xmlattr>.status_code", 503);
-        tree.put("root.<xmlattr>.status_message", "Privacy screen unavailable. Select a Windows indirect virtual display as the output.");
+        tree.put("root.<xmlattr>.status_message", result == privacy_api_unavailable ? "Privacy screen unavailable. Windows display settings are temporarily unavailable. Unlock the host and try again." : "Privacy screen unavailable. Select a Windows indirect virtual display as the output.");
         return;
       }
 
@@ -1561,6 +1577,14 @@ namespace nvhttp {
     }
 
     advertise_clipboard(tree, launch_session->clipboard_grant);
+#ifdef _WIN32
+    tree.put("root.hostmuteversion", 1);
+    tree.put("root.privacyscreenversion", 1);
+    tree.put("root.disconnectlocksession", launch_session->id);
+#endif
+    if (launch_session->privacy_screen) {
+      tree.put("root.privacyscreen", 1);
+    }
     rtsp_stream::launch_session_raise(launch_session);
 
     // Stream was started successfully, we will revert the config when the app or session terminates
@@ -1622,14 +1646,21 @@ namespace nvhttp {
     // so we should use it if it's present in the args and there are
     // no active sessions we could be interfering with.
     const bool no_active_sessions {rtsp_stream::session_count() == 0};
-    if (no_active_sessions && args.find("localAudioPlayMode"s) != std::end(args)) {
-      host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
+    const bool requested_audio = no_active_sessions && args.contains("localAudioPlayMode"s) ?
+                                   util::from_view(get_arg(args, "localAudioPlayMode")) != 0 :
+                                   host_audio;
+    const auto launch_session = make_launch_session(requested_audio, args, identity);
+    if (!no_active_sessions && config::video.dd.configuration_option != config::video_t::dd_t::config_option_e::privacy_screen && (launch_session->privacy_screen || rtsp_stream::has_private_session())) {
+      tree.put("root.resume", 0);
+      tree.put("root.<xmlattr>.status_code", 409);
+      tree.put("root.<xmlattr>.status_message", "Privacy screen requires an exclusive streaming session");
+      return;
     }
-    const auto launch_session = make_launch_session(host_audio, args, identity);
+    host_audio = requested_audio;
 
     // An unsuccessful resume can leave a background application alive without a stream.
     auto privacy_guard = util::fail_guard([&]() {
-      if (no_active_sessions && config::video.dd.configuration_option == config::video_t::dd_t::config_option_e::privacy_screen) {
+      if (no_active_sessions && launch_session->privacy_screen) {
         display_device::revert_configuration();
       }
     });
@@ -1638,10 +1669,11 @@ namespace nvhttp {
       // We want to prepare display only if there are no active sessions at
       // the moment. This should be done before probing encoders as it could
       // change the active displays.
-      if (!display_device::configure_display(config::video, *launch_session)) {
+      using enum display_device::configuration_result_e;
+      if (const auto result = display_device::configure_display(config::video, *launch_session); result != ready) {
         tree.put("root.resume", 0);
         tree.put("root.<xmlattr>.status_code", 503);
-        tree.put("root.<xmlattr>.status_message", "Privacy screen unavailable. Select a Windows indirect virtual display as the output.");
+        tree.put("root.<xmlattr>.status_message", result == privacy_api_unavailable ? "Privacy screen unavailable. Windows display settings are temporarily unavailable. Unlock the host and try again." : "Privacy screen unavailable. Select a Windows indirect virtual display as the output.");
         return;
       }
 
@@ -1686,6 +1718,14 @@ namespace nvhttp {
     }
 
     advertise_clipboard(tree, launch_session->clipboard_grant);
+#ifdef _WIN32
+    tree.put("root.hostmuteversion", 1);
+    tree.put("root.privacyscreenversion", 1);
+    tree.put("root.disconnectlocksession", launch_session->id);
+#endif
+    if (launch_session->privacy_screen) {
+      tree.put("root.privacyscreen", 1);
+    }
     rtsp_stream::launch_session_raise(launch_session);
     privacy_guard.disable();
   }
@@ -1798,6 +1838,71 @@ namespace nvhttp {
     }
   }
 
+  /** @brief Validate and authorize the request before invoking the workstation lock. */
+  int host_lock_status(std::size_t header_count, std::string_view header, std::size_t body_size, auto &&authorized, auto &&lock) {
+    if (header_count != 1 || header != "1" || body_size != 0) {
+      return 400;
+    }
+    if (!authorized()) {
+      return 403;
+    }
+    return lock() ? 202 : 503;
+  }
+
+  /** @brief Request a workstation lock from an enabled paired client with a running stream. */
+  void handle_host_lock(resp_https_t response, req_https_t request, const std::string &cert) {
+    using status = SimpleWeb::StatusCode;
+    const auto header = request->header.find("X-Moonlight-Host-Lock");
+    const auto code = host_lock_status(request->header.count("X-Moonlight-Host-Lock"), header == request->header.end() ? std::string_view {} : header->second, request->content.size(), [&cert] {
+      return paired_client_enabled(cert) && rtsp_stream::has_running_session(cert);
+    },
+                                       platf::lock_workstation);
+    response->write(static_cast<status>(code), SimpleWeb::CaseInsensitiveMultimap {{"Cache-Control", "no-store"}});
+  }
+
+  /** @brief Apply disconnect locking to the specified active stream and return the effective policy. */
+  void handle_disconnect_lock(resp_https_t response, req_https_t request, const std::string &cert) {
+    using status = SimpleWeb::StatusCode;
+    const auto header = request->header.find("X-Moonlight-Disconnect-Lock");
+    const auto args = request->parse_query_string();
+    const auto id = get_arg(args, "session", "");
+    const auto enabled = get_arg(args, "enabled", "");
+    if (header == request->header.end() || header->second != "1" || request->header.count("X-Moonlight-Disconnect-Lock") != 1 || request->content.size() != 0 || args.count("session") != 1 || id.empty() || args.count("enabled") != 1 || (enabled != "1" && enabled != "0")) {
+      response->write(status::client_error_bad_request);
+      return;
+    }
+    const auto result = paired_client_enabled(cert) ? rtsp_stream::update_disconnect_lock(cert, id, enabled == "1") : std::nullopt;
+    if (!result.has_value()) {
+      response->write(status::client_error_forbidden);
+      return;
+    }
+    response->write(status::success_ok, *result ? "1" : "0", SimpleWeb::CaseInsensitiveMultimap {{"Cache-Control", "no-store"}});
+  }
+
+  /** @brief Authenticate and validate access to the Windows playback mute control. */
+  std::pair<int, std::optional<bool>> host_mute_status(std::size_t header_count, std::string_view header, std::size_t body_size, std::size_t action_count, std::string_view action, auto &&authorized, auto &&volume) {
+    if (header_count != 1 || header != "1" || body_size || action_count != 1 || (action != "get" && action != "mute" && action != "unmute")) {
+      return {400, std::nullopt};
+    }
+    if (!authorized()) {
+      return {403, std::nullopt};
+    }
+    auto state = volume(action == "get" ? std::nullopt : std::optional {action == "mute"});
+    return {state ? 200 : 503, state};
+  }
+
+  /** @brief Return the mute state only to an enabled paired client with an active stream. */
+  void handle_host_mute(resp_https_t response, req_https_t request, const std::string &cert) {
+    using status = SimpleWeb::StatusCode;
+    const auto header = request->header.find("X-Moonlight-Host-Mute");
+    const auto args = request->parse_query_string();
+    const auto [code, muted] = host_mute_status(request->header.count("X-Moonlight-Host-Mute"), header == request->header.end() ? std::string_view {} : header->second, request->content.size(), args.count("action"), get_arg(args, "action", ""), [&cert] {
+      return paired_client_enabled(cert) && rtsp_stream::has_running_session(cert);
+    },
+                                                platf::host_audio_mute);
+    response->write(static_cast<status>(code), muted ? (*muted ? "1" : "0") : "", SimpleWeb::CaseInsensitiveMultimap {{"Cache-Control", "no-store"}});
+  }
+
   /** @brief Authenticate a file-only connection and bind its staging state to the verified certificate. */
   int change_file_session(const std::string &cert, const std::string &token, bool close) {
     if (!clipboard::valid_token(token)) {
@@ -1851,7 +1956,7 @@ namespace nvhttp {
     const auto args = request->parse_query_string();
     const auto replace = get_arg(args, "replace", "");
     const auto active = [&]() {
-      return ((op != "delete" && replace.empty()) || config::nvhttp.file_browser_delete) && file_session(cert, token->second) == session;
+      return ((op != "delete" && op != "rmdir" && replace.empty()) || config::nvhttp.file_browser_delete) && file_session(cert, token->second) == session;
     };
     const auto parse = [](const std::string &arg, auto &out) {
       const auto end = arg.data() + arg.size();
@@ -1869,8 +1974,8 @@ namespace nvhttp {
         return;
       }
     }
-    const bool chunk = op == "write" || op == "read" || op == "chunk";
-    if ((chunk && !parse(get_arg(args, "offset", ""), offset)) || ((chunk || op == "resume" || op == "identity" || op == "delete") && !parse(get_arg(args, "size", ""), size))) {
+    const bool chunk = op == "write" || op == "read" || op == "read-pinned" || op == "chunk";
+    if ((chunk && !parse(get_arg(args, "offset", ""), offset)) || ((chunk || op == "prepare-upload" || op == "resume" || op == "identity" || op == "open-read" || op == "delete") && !parse(get_arg(args, "size", ""), size))) {
       response->write(status::client_error_bad_request);
       return;
     }
@@ -1890,7 +1995,7 @@ namespace nvhttp {
         response->write(status::client_error_forbidden);
         return;
       }
-      SimpleWeb::CaseInsensitiveMultimap headers {{"Cache-Control", "no-store"}, {"Content-Type", op == "read" ? "application/octet-stream" : "application/json"}};
+      SimpleWeb::CaseInsensitiveMultimap headers {{"Cache-Control", "no-store"}, {"Content-Type", op == "read" || op == "read-pinned" ? "application/octet-stream" : "application/json"}};
       if (ack) {
         headers.emplace("X-File-Offset", std::to_string(*ack));
       }
@@ -1935,12 +2040,12 @@ namespace nvhttp {
     const auto id = get_arg(args, "id", "");
     const auto task = get_arg(args, "task", "");
     const auto previous = get_arg(args, "previous", "");
-    if ((!grant.resumable && (op == "resume" || op == "discard" || !task.empty())) || (args.count("task") && (args.count("task") != 1 || task.empty())) || ((op == "target" || op == "deliver") && task.empty()) || (args.count("previous") && (op != "target" || args.count("previous") != 1 || previous.empty()))) {
+    if ((!grant.resumable && (op == "resume" || op == "discard" || !task.empty())) || (args.count("task") && (args.count("task") != 1 || task.empty())) || ((op == "target" || op == "prepare" || op == "deliver") && task.empty()) || (args.count("previous") && (op != "target" || args.count("previous") != 1 || previous.empty()))) {
       response->write(status::client_error_bad_request);
       return;
     }
     const auto length = request->content.size();
-    if (length > (op == "chunk" ? 4U * 1024 * 1024 : 64U * 1024)) {
+    if (length > (op == "chunk" ? 4U * 1024 * 1024 : 1024U * 1024)) {
       response->write(status::client_error_payload_too_large);
       return;
     }
@@ -1958,7 +2063,7 @@ namespace nvhttp {
       }
     }
     try {
-      const auto result = platf::exchange_clipboard_batch(*grant.upload_session, op, id, file, offset, since, request->content.string(), active, task, previous);
+      const auto result = platf::exchange_clipboard_batch(*grant.upload_session, op, id, file, offset, since, request->content.string(), active, task, previous, grant.browser && config::nvhttp.file_browser_delete);
       SimpleWeb::CaseInsensitiveMultimap headers {{"Cache-Control", "no-store"}};
       if (!result.task.empty()) {
         headers.emplace("X-Clipboard-Task", result.task);
@@ -1972,13 +2077,13 @@ namespace nvhttp {
       if (!result.conflict.empty()) {
         headers.emplace("X-Clipboard-Conflict", result.conflict);
       }
-      if (result.status >= 400) {
+      if (result.status >= 400 && result.conflict != "file") {
         // Report only fixed operation names, offsets and status; limit repeated failures.
         static std::atomic<std::int64_t> next_log_ms {};
         const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
         auto next = next_log_ms.load(std::memory_order_relaxed);
         if (now >= next && next_log_ms.compare_exchange_strong(next, now + 1000, std::memory_order_relaxed)) {
-          const auto phase = op == "begin" || op == "resume" || op == "discard" || op == "chunk" || op == "commit" || op == "abort" || op == "target" || op == "deliver" ? op : "unknown";
+          const auto phase = op == "begin" || op == "resume" || op == "prepare" || op == "discard" || op == "chunk" || op == "commit" || op == "abort" || op == "target" || op == "deliver" ? op : "unknown";
           BOOST_LOG(warning) << "Clipboard file batch " << phase << " failed, HTTP " << result.status << ", offset " << offset << ", reason " << (result.conflict.empty() ? "unspecified"sv : result.conflict);
         }
       }
@@ -2085,6 +2190,7 @@ namespace nvhttp {
     const bool independent = request->header.count("X-Clipboard-Independent") == 1 &&
                              request->header.find("X-Clipboard-Independent")->second == "1";
     download.metadata_only = !independent && download.op == "1" && get_arg(args, "metadataOnly", "") == "1";
+    download.folders = get_arg(args, "folders", "") == "1";
     if (download.op == "offer" && !independent) {
       response->write(status::client_error_bad_request);
       return;
@@ -2273,15 +2379,24 @@ namespace nvhttp {
     https_server.resource["^/hostpower$"]["POST"] = [&](auto resp, auto req) {
       handle_host_power(resp, req, https_server.client_identity(*req).first);
     };
+    https_server.resource["^/hostlock$"]["POST"] = [&](auto resp, auto req) {
+      handle_host_lock(resp, req, https_server.client_identity(*req).first);
+    };
+    https_server.resource["^/disconnectlock$"]["POST"] = [&](auto resp, auto req) {
+      handle_disconnect_lock(resp, req, https_server.client_identity(*req).first);
+    };
+    https_server.resource["^/hostmute$"]["POST"] = [&](auto resp, auto req) {
+      handle_host_mute(resp, req, https_server.client_identity(*req).first);
+    };
     https_server.resource["^/files/session$"]["POST"] = [&](auto resp, auto req) {
       handle_file_session(resp, req, https_server.client_identity(*req).first, false);
     };
     https_server.resource["^/files/session/end$"]["POST"] = [&](auto resp, auto req) {
       handle_file_session(resp, req, https_server.client_identity(*req).first, true);
     };
-    for (const auto *op : {"list", "places", "read", "write", "abort", "mkdir", "delete", "capabilities", "identity", "resume", "chunk", "commit", "discard", "drag-source", "drop-target"}) {
+    for (const auto *op : {"list", "places", "read", "write", "abort", "mkdir", "delete", "rmdir", "folder-path", "capabilities", "identity", "open-read", "read-pinned", "prepare-upload", "resume", "chunk", "commit", "discard", "drag-source", "drop-target"}) {
       const std::string_view operation(op);
-      const auto method = operation == "list" || operation == "places" || operation == "read" || operation == "capabilities" || operation == "identity" || operation == "drag-source" || operation == "drop-target" ? "GET" : "POST";
+      const auto method = operation == "list" || operation == "places" || operation == "read" || operation == "folder-path" || operation == "capabilities" || operation == "identity" || operation == "open-read" || operation == "read-pinned" || operation == "drag-source" || operation == "drop-target" ? "GET" : "POST";
       https_server.resource["^/files/"s + op + "$"][method] = [&](auto resp, auto req) {
         handle_files(resp, req, https_server.client_identity(*req).first);
       };
@@ -2474,6 +2589,27 @@ namespace nvhttp {
 
     bool client_may_control_host_power(const std::string &cert) {
       return may_control_host_power(cert);
+    }
+
+    int request_host_lock(std::size_t header_count, std::string_view header, std::size_t body_size, bool authorized, bool accepted) {
+      return host_lock_status(header_count, header, body_size, [authorized] {
+        return authorized;
+      },
+                              [accepted] {
+                                return accepted;
+                              });
+    }
+
+    std::pair<int, std::optional<bool>> request_host_mute(std::size_t header_count, std::string_view header, std::size_t body_size, std::size_t action_count, std::string_view action, bool authorized, std::optional<bool> &device_state) {
+      return host_mute_status(header_count, header, body_size, action_count, action, [authorized] {
+        return authorized;
+      },
+                              [&device_state](std::optional<bool> desired) {
+                                if (device_state && desired) {
+                                  device_state = desired;
+                                }
+                                return device_state;
+                              });
     }
   #endif
 

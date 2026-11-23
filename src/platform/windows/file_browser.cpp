@@ -4,6 +4,7 @@
  */
 #include "clipboard.h"
 #include "clipboard_selection.h"
+#include "clipboard_tree.h"
 #include "clipboard_win32.h"
 #include "file_drag.h"
 #include "file_transfer.h"
@@ -16,6 +17,7 @@
 #include <map>
 #include <mutex>
 #include <nlohmann/json.hpp>
+#include <wtsapi32.h>
 
 namespace platf {
   namespace fs = std::filesystem;
@@ -23,6 +25,20 @@ namespace platf {
   namespace {
     using namespace win_clipboard::detail;
     using namespace file_transfer;
+
+    /** @brief Check the shell token's session and report whether Windows has locked it. */
+    bool connected_shell(HANDLE token, bool &locked) {
+      DWORD session_id {}, bytes {};
+      LPWSTR buffer {};
+      if (!GetTokenInformation(token, TokenSessionId, &session_id, sizeof(session_id), &bytes) || !WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, session_id, WTSSessionInfoEx, &buffer, &bytes)) {
+        return false;
+      }
+      const auto *info = reinterpret_cast<const WTSINFOEXW *>(buffer);
+      const bool connected = bytes >= sizeof(*info) && info->Level == 1 && info->Data.WTSInfoExLevel1.SessionState == WTSActive;
+      locked = connected && info->Data.WTSInfoExLevel1.SessionFlags == WTS_SESSIONSTATE_LOCK;
+      WTSFreeMemory(buffer);
+      return connected;
+    }
 
     /** @brief Encode canonical Windows paths with forward separators for both peers. */
     std::string wire_path(const fs::path &path) {
@@ -202,7 +218,18 @@ namespace platf {
     file_drag::display_t display;  ///< Empty for standalone browser grants.
     std::optional<LUID> logon;  ///< Desktop logon that owns this connection and its upload handles.
     std::map<std::string, upload_t> uploads;  ///< Pending uploads identified by client nonce.
+#ifdef SUNSHINE_TESTS
+    std::atomic_bool simulate_lock {};  ///< Simulate a locked Windows session for this grant.
+#endif
   };
+
+#ifdef SUNSHINE_TESTS
+  namespace test_support {
+    void lock_file_session(file_browser_session_t &session) {
+      session.simulate_lock = true;
+    }
+  }  // namespace test_support
+#endif
 
   void set_file_drag_display(file_browser_session_t &session, int left, int top, int width, int height, int stream_width, int stream_height) {
     std::lock_guard guard(session.mutex);
@@ -293,20 +320,23 @@ namespace platf {
   }
 
   int exchange_files(file_browser_session_t &session, std::string_view operation, std::string_view name, const std::string &id, std::uint64_t offset, std::uint64_t size, std::optional<std::int64_t> modified, std::string_view input, std::string &output, const std::function<bool()> &active, std::string_view cert, std::string_view digest, std::optional<std::uint64_t> *ack, bool allow_delete, std::optional<std::pair<unsigned, unsigned>> drag_point, std::string_view replace, std::string_view name_filter) {
-    if ((operation == "write" || operation == "abort" || operation == "resume" || operation == "chunk" || operation == "commit" || operation == "discard" || operation == "identity") && (id.size() != 32 || id.find_first_not_of("0123456789abcdef") != std::string::npos)) {
+    const bool pinned_read = operation == "read-pinned";
+    const bool open_read = operation == "open-read";
+    const bool resumable_upload = operation == "prepare-upload" || operation == "resume" || operation == "chunk" || operation == "commit" || operation == "discard";
+    if ((operation == "write" || operation == "abort" || resumable_upload || operation == "identity" || open_read || pinned_read) && (id.size() != 32 || id.find_first_not_of("0123456789abcdef") != std::string::npos)) {
       return 400;
     }
     if (size > static_cast<std::uint64_t>((std::numeric_limits<LONGLONG>::max)()) || offset > size || name.size() > 4 * 32767) {
       return 400;
     }
-    if (!replace.empty() && (replace.size() > 96 || (operation != "write" && operation != "resume" && operation != "commit"))) {
+    if (!replace.empty() && (replace.size() > 96 || (operation != "write" && operation != "prepare-upload" && operation != "resume" && operation != "commit"))) {
       return 400;
     }
-    if (!active() || ((operation == "delete" || !replace.empty()) && !allow_delete)) {
+    if (!active() || ((operation == "delete" || operation == "rmdir" || !replace.empty()) && !allow_delete)) {
       return 403;
     }
     if (operation == "capabilities") {
-      output = nlohmann::json({{"version", 2}, {"deleteFiles", allow_delete}}).dump();
+      output = nlohmann::json({{"version", 2}, {"deleteFiles", allow_delete}, {"deleteDirectories", allow_delete}, {"folderPaths", true}, {"backgroundTransfers", true}}).dump();
       return 200;
     }
     if (operation == "abort") {
@@ -316,9 +346,29 @@ namespace platf {
       return 204;
     }
     desktop::shell_impersonation_t user;
-    if (!user.begin() || !desktop::on_user_desktop()) {
+    if (!user.begin()) {
       return 403;
     }
+    bool interactive = desktop::on_user_desktop();
+#ifdef SUNSHINE_TESTS
+    interactive = interactive && !session.simulate_lock;
+#endif
+    bool locked = false;
+    if (!interactive) {
+      if (!connected_shell(user.token, locked)) {
+        return 403;
+      }
+#ifdef SUNSHINE_TESTS
+      locked = locked || session.simulate_lock;
+#endif
+      if (operation == "drag-source" || operation == "drop-target" || operation == "delete" || operation == "rmdir") {
+        return 403;
+      }
+      if (!locked && !(pinned_read || open_read || resumable_upload)) {
+        return 403;
+      }
+    }
+    const bool can_start_transfer = interactive || locked;
     TOKEN_STATISTICS stats {};
     DWORD needed {};
     if (!GetTokenInformation(user.token, TokenStatistics, &stats, sizeof(stats), &needed)) {
@@ -327,6 +377,9 @@ namespace platf {
     {
       std::lock_guard lock(session.mutex);
       if (!session.logon) {
+        if (!can_start_transfer) {
+          return 403;
+        }
         session.logon = stats.AuthenticationId;
       }
       if (session.logon->HighPart != stats.AuthenticationId.HighPart || session.logon->LowPart != stats.AuthenticationId.LowPart) {
@@ -371,25 +424,42 @@ namespace platf {
     if (operation == "list") {
       return list_files(path, output, allow_delete, name_filter);
     }
+    if (operation == "folder-path") {
+      std::vector<file_handle> parents;
+      const auto status = pin_directory(path, parents);
+      if (status != 200) {
+        return status;
+      }
+      file_handle root;
+      if (parents.empty() && !win_clipboard::tree::pin_folder(path, root)) {
+        return 403;
+      }
+      output = to_utf8(win_clipboard::tree::folder_path(parents.empty() ? root.get() : parents.back().get()));
+      return output.empty() ? 409 : 200;
+    }
     if (!valid_name(path.filename().native())) {
       return 400;
     }
-    std::vector<file_handle> pins;
-    const int result = pin_directory(path.parent_path(), pins);
-    if (result != 200) {
-      return result;
-    }
-    if (operation == "resume" || operation == "chunk" || operation == "commit" || operation == "discard") {
+    if (resumable_upload) {
       std::optional<std::uint64_t> confirmed;
-      const int status = resumable_files.exchange(operation, cert, stats.AuthenticationId, session.serial, path, id, digest, offset, size, input, pins, output, confirmed, active, replace);
+      const int status = resumable_files.exchange(operation, cert, stats.AuthenticationId, session.serial, path, id, digest, offset, size, input, output, confirmed, active, replace, can_start_transfer);
       if (ack) {
         *ack = confirmed;
       }
       return status;
     }
-    if (operation == "identity") {
+    if (operation == "identity" || open_read) {
       std::lock_guard lock(session.mutex);
-      return file_transfer::source_identity(session.identities, id, path, size, modified, output, active);
+      return file_transfer::source_identity(session.identities, id, path, size, modified, output, active, open_read, can_start_transfer);
+    }
+    if (pinned_read) {
+      std::lock_guard lock(session.mutex);
+      return file_transfer::read_pinned_source(session.identities, id, path, offset, size, modified, output);
+    }
+    std::vector<file_handle> pins;
+    const int result = pin_directory(path.parent_path(), pins);
+    if (result != 200) {
+      return result;
     }
     if (operation == "read") {
       return read_file(path, offset, size, modified, output);
@@ -407,6 +477,25 @@ namespace platf {
         return 403;
       }
       return disposition(file.get(), true) ? 204 : file_error();
+    }
+    if (operation == "rmdir") {
+      if (!modified) {
+        return 400;
+      }
+      auto raw = CreateFileW(path.c_str(), DELETE | FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+      if (raw == INVALID_HANDLE_VALUE) {
+        return file_error();
+      }
+      file_handle folder(raw);
+      BY_HANDLE_FILE_INFORMATION info {};
+      if (!GetFileInformationByHandle(raw, &info)) {
+        return file_error();
+      }
+      if (!(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) || milliseconds(info.ftLastWriteTime) != *modified) {
+        return 409;
+      }
+      const auto error = remove_tree(path, raw, info.dwFileAttributes, active);
+      return error ? file_error(error) : 204;
     }
     if (operation == "write") {
       return write_chunk(session, path, id, offset, size, input, active, replace);

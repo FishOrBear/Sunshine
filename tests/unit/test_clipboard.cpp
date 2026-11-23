@@ -476,6 +476,7 @@ TEST(FileBrowserTest, RequiresExplicitDeletePermissionAndAnUnchangedRegularFile)
   for (const bool allow : {false, true}) {
     ASSERT_EQ(exchange("capabilities", {}, 0, {}, allow, active), 200);
     EXPECT_EQ(nlohmann::json::parse(out).at("deleteFiles"), allow);
+    EXPECT_EQ(nlohmann::json::parse(out).at("deleteDirectories"), allow);
   }
   EXPECT_EQ(exchange("delete", {}, 0, {}, false, active), 403);
   if (exchange("list", {}, 0, {}, true, active) == 403) {
@@ -488,6 +489,8 @@ TEST(FileBrowserTest, RequiresExplicitDeletePermissionAndAnUnchangedRegularFile)
   const auto dir = fs::temp_directory_path() / unique;
   ASSERT_TRUE(fs::create_directory(dir));
   const auto file = dir / L"delete me.txt";
+  ASSERT_EQ(exchange("folder-path", dir, 0, {}, false, active), 200);
+  EXPECT_NE(out.find(win_clipboard::detail::to_utf8(dir.filename().native())), std::string::npos);
   auto cleanup = util::fail_guard([&] {
     std::error_code ignored;
     fs::remove(file, ignored);
@@ -509,6 +512,18 @@ TEST(FileBrowserTest, RequiresExplicitDeletePermissionAndAnUnchangedRegularFile)
   EXPECT_EQ(exchange("delete", file, 5, stamp, true, active), 204);
   EXPECT_FALSE(fs::exists(file));
   EXPECT_EQ(exchange("delete", file, 5, stamp, true, active), 404);
+  const auto tree = dir / L"tree";
+  ASSERT_TRUE(fs::create_directories(tree / L"empty"));
+  ASSERT_TRUE(std::ofstream(tree / L"child") << "contents");
+  ASSERT_EQ(exchange("list", dir, 0, {}, true, active), 200);
+  const auto folder_stamp = std::stoll(nlohmann::json::parse(out).at("entries").at(0).at("modified").get<std::string>());
+  EXPECT_EQ(exchange("rmdir", tree, 0, folder_stamp, false, active), 403);
+  EXPECT_EQ(exchange("rmdir", tree, 0, {}, true, active), 400);
+  EXPECT_EQ(exchange("rmdir", tree, 0, folder_stamp + 1, true, active), 409);
+  EXPECT_TRUE(fs::exists(tree / L"child"));
+  EXPECT_EQ(exchange("rmdir", tree, 0, folder_stamp, true, active), 204);
+  EXPECT_FALSE(fs::exists(tree));
+  EXPECT_TRUE(fs::exists(dir));
 }
 
 TEST(ClipboardBatchTest, RejectsInvalidManifestsAndUses64BitLengths) {
@@ -529,6 +544,34 @@ TEST(ClipboardBatchTest, RejectsInvalidManifestsAndUses64BitLengths) {
   entries.clear();
   total = 0;
   EXPECT_EQ(manifest(R"([{"name":"a","size":9223372036854775807},{"name":"b","size":9223372036854775807},{"name":"c","size":2}])", entries, total), 413);
+}
+
+TEST(ClipboardBatchTest, StagesFolderSelectionsAndRollsBackOnlyThePrivateTree) {
+  namespace fs = std::filesystem;
+  const auto root = fs::temp_directory_path() / platf::new_file_lease();
+  auto cleanup = util::fail_guard([&] {
+    std::error_code ec;
+    fs::remove_all(root, ec);
+  });
+  constexpr auto manifest = R"([{"name":"photos/","size":0},{"name":"photos/empty/","size":0},{"name":"photos/one","size":3},{"name":"loose","size":0}])";
+  {
+    platf::clipboard_upload::batch_t batch;
+    ASSERT_EQ(batch.begin(root, manifest), 200);
+    EXPECT_TRUE(fs::is_directory(batch.directory / "photos/empty"));
+    EXPECT_EQ(batch.append(0, 0, "x"), 413);
+    EXPECT_EQ(batch.append(2, 0, "abc"), 204);
+    DWORD revision {};
+    EXPECT_EQ(batch.commit({}, revision, [] {
+      return false;
+    }),
+              403);
+  }
+  EXPECT_TRUE(fs::is_empty(root));
+  for (const auto body : {R"([{"name":"a/","size":1}])", R"([{"name":"a/b","size":1}])", R"([{"name":"a/","size":0},{"name":"a/../escape","size":1}])", R"([{"name":"a/","size":0},{"name":"A","size":0}])"}) {
+    platf::clipboard_upload::batch_t invalid;
+    EXPECT_EQ(invalid.begin(root, body), 400);
+    EXPECT_TRUE(fs::is_empty(root));
+  }
 }
 
   #ifdef GTEST_HAS_DEATH_TEST
@@ -673,6 +716,7 @@ namespace {
     LUID logon {7, 3};
     std::uint64_t stream = 1;
     bool active = true;
+    bool allow_replace = false;
     std::string lease;
     std::string task;
 
@@ -692,11 +736,12 @@ namespace {
     }
 
     platf::clipboard_upload_result_t send(std::string_view op, std::string_view bytes = {}, std::uint64_t offset = 0, std::optional<DWORD> since = {}) {
-      const auto id = op == "resume" || op == "discard" ? std::string_view {} : std::string_view(lease);
+      const auto id = op == "resume" || op == "prepare" || op == "discard" ? std::string_view {} : std::string_view(lease);
       return cache.exchange(root, cert, logon, stream, op, id, 0, offset, since, bytes, [&] {
         return active;
       },
-                            task);
+                            task,
+                            allow_replace);
     }
 
     void resume(std::uint64_t expected) {
@@ -764,6 +809,225 @@ TEST(ClipboardResumeTest, DeliversInterleavedPastesToTheirCapturedFoldersWithout
   EXPECT_EQ(fs::file_size(a / L"empty"), 0U);
   EXPECT_EQ(fs::file_size(b / L"empty"), 0U);
   EXPECT_EQ(fs::remove_all(t.root), 8U);
+}
+
+TEST(ClipboardResumeTest, MergesFolderPasteAndReadsItBackAtTheOriginalIndices) {
+  resume_test_t t;
+  t.root += "-" + platf::new_file_lease();
+  auto cleanup = util::fail_guard([&] {
+    std::error_code ec;
+    fs::remove_all(t.root, ec);
+  });
+  const auto photos = t.root / L"photos";
+  ASSERT_TRUE(fs::create_directories(photos));
+  ASSERT_TRUE(std::ofstream(photos / "part") << "old");
+  ASSERT_TRUE(std::ofstream(photos / "untouched") << "original");
+  t.task.assign(32, 'f');
+  ASSERT_EQ(t.capture(t.root), 204);
+  auto files = nlohmann::json::parse(resume_manifest);
+  files[0]["name"] = "photos/part";
+  files[1]["name"] = "photos/nested/zero";
+  files.insert(files.begin(), nlohmann::json {{"name", "photos/nested/"}, {"size", 0}});
+  files.insert(files.begin(), nlohmann::json {{"name", "photos/"}, {"size", 0}});
+  files.push_back({{"name", "photos/empty/"}, {"size", 0}});
+  auto result = t.send("prepare", files.dump());
+  ASSERT_EQ(result.conflict, "file");
+  EXPECT_EQ(nlohmann::json::parse(result.id)["file"], 2);
+  files[2]["resolution"] = "keep-both";
+  result = t.send("prepare", files.dump());
+  ASSERT_EQ(result.status, 200);
+  t.lease = nlohmann::json::parse(result.id)["id"].get<std::string>();
+  ASSERT_EQ(t.cache.exchange(t.root, t.cert, t.logon, t.stream, "chunk", t.lease, 2, 0, {}, "abc", [] {
+                     return true;
+                   },
+                             t.task)
+              .status,
+            204);
+  ASSERT_EQ(t.send("deliver").status, 204);
+  EXPECT_EQ(t.send("deliver").status, 204);
+  EXPECT_TRUE(fs::is_empty(photos / "empty"));
+  EXPECT_EQ(fs::file_size(photos / "nested/zero"), 0U);
+  EXPECT_EQ(fs::file_size(photos / "untouched"), 8U);
+  std::string value;
+  EXPECT_TRUE(std::ifstream(photos / "part") >> value);
+  EXPECT_EQ(value, "old");
+  EXPECT_TRUE(std::ifstream(photos / "part (2)") >> value);
+  EXPECT_EQ(value, "abc");
+
+  platf::clipboard_download_t offer, task;
+  const DWORD revision = GetClipboardSequenceNumber();
+  std::string output;
+  EXPECT_EQ(offer.pin({photos}, revision, t.logon, output, true, false), 204);
+  ASSERT_EQ(offer.pin({photos}, revision, t.logon, output, true, true), 200);
+  const auto metadata = nlohmann::json::parse(output.substr(1)).at("files");
+  ASSERT_EQ(offer.reopen(offer.lease, revision, t.logon, task, output), 200);
+  EXPECT_EQ(nlohmann::json::parse(output.substr(1)).at("files"), metadata);
+  EXPECT_EQ(metadata[0]["name"], "photos/");
+  auto part = std::find_if(metadata.begin(), metadata.end(), [](const auto &item) {
+    return item["name"] == "photos/part (2)";
+  });
+  ASSERT_NE(part, metadata.end());
+  const auto index = static_cast<std::uint32_t>(std::distance(metadata.begin(), part));
+  EXPECT_EQ(task.read({"chunk", task.lease, index, 0}, revision, {}, t.logon, output), 200);
+  EXPECT_EQ(output, "abc");
+  EXPECT_EQ(task.read({"chunk", task.lease, 0, 0}, revision, {}, t.logon, output), 400);
+  EXPECT_EQ(task.read({"finish", task.lease}, revision, {}, t.logon, output), 204);
+  ASSERT_TRUE(std::ofstream(photos / "part") << "changed");
+  EXPECT_EQ(offer.reopen(offer.lease, revision, t.logon, task, output), 409);
+}
+
+TEST(ClipboardResumeTest, AsksBeforeStagingAndAppliesEachExplorerChoiceOnlyOnce) {
+  for (const std::string_view choice : {"skip", "keep-both", "replace"}) {
+    SCOPED_TRACE(choice);
+    resume_test_t t;
+    t.root += "-" + platf::new_file_lease();
+    ASSERT_TRUE(fs::create_directories(t.root));
+    const auto path = t.root / L"part";
+    std::ofstream(path) << "original";
+    std::ofstream(t.root / L"part (2)") << "occupied";
+    t.task.assign(32, 'a');
+    ASSERT_EQ(t.capture(t.root), 204);
+    auto files = nlohmann::json::parse(resume_manifest);
+    auto result = t.send("prepare", files.dump());
+    ASSERT_EQ(result.conflict, "file");
+    auto conflict = nlohmann::json::parse(result.id);
+    EXPECT_EQ(conflict.at("reason"), "permission");
+    EXPECT_EQ(conflict.at("version"), "");
+    EXPECT_EQ(conflict.at("file"), 0);
+    EXPECT_EQ(conflict.at("path"), win_clipboard::detail::to_utf8(path.native()));
+    EXPECT_EQ(std::distance(fs::directory_iterator(t.root), fs::directory_iterator {}), 2);
+    t.allow_replace = true;
+    result = t.send("prepare", files.dump());
+    ASSERT_EQ(result.status, 409);
+    conflict = nlohmann::json::parse(result.id);
+    ASSERT_NE(conflict.at("version"), "");
+    files[0]["resolution"] = false;
+    EXPECT_EQ(t.send("prepare", files.dump()).status, 400);
+    files[0]["resolution"] = choice == "replace" ? conflict.at("version").get<std::string>() : std::string(choice);
+    result = t.send("prepare", files.dump());
+    ASSERT_EQ(result.status, 200);
+    auto prepared = nlohmann::json::parse(result.id);
+    t.lease = prepared.at("id").get<std::string>();
+    if (choice == "skip") {
+      EXPECT_EQ(prepared.at("skipped"), nlohmann::json::array({0}));
+      EXPECT_EQ(prepared.at("offsets"), nlohmann::json::array({3, 0}));
+    } else {
+      EXPECT_EQ(prepared.at("offsets"), nlohmann::json::array({0, 0}));
+      EXPECT_EQ(t.send("deliver", R"({"file":0,"resolution":"skip"})").status, 400);
+      EXPECT_EQ(t.send("chunk", "abc").status, 204);
+    }
+    EXPECT_EQ(fs::file_size(path), 8U);
+    ASSERT_EQ(t.send("deliver").status, 204);
+    ++t.stream;
+    result = t.send("prepare", resume_manifest);
+    ASSERT_EQ(result.status, 200);
+    prepared = nlohmann::json::parse(result.id);
+    t.lease = prepared.at("id").get<std::string>();
+    EXPECT_TRUE(prepared.at("committed").get<bool>());
+    EXPECT_EQ(t.send("deliver").status, 204);
+    std::string content;
+    EXPECT_TRUE(std::ifstream(path) >> content);
+    EXPECT_EQ(content, choice == "replace" ? "abc" : "original");
+    EXPECT_TRUE(std::ifstream(t.root / L"part (2)") >> content);
+    EXPECT_EQ(content, "occupied");
+    EXPECT_EQ(fs::exists(t.root / L"part (3)"), choice == "keep-both");
+    if (choice == "keep-both") {
+      EXPECT_TRUE(std::ifstream(t.root / L"part (3)") >> content);
+      EXPECT_EQ(content, "abc");
+    }
+    EXPECT_FALSE(fs::exists(t.root / L"part (4)"));
+    EXPECT_EQ(fs::file_size(t.root / L"empty"), 0U);
+    EXPECT_GT(fs::remove_all(t.root), 0U);
+  }
+}
+
+TEST(ClipboardResumeTest, ReportsAllInitialCollisionsAndRechecksEachApprovedVersion) {
+  resume_test_t t;
+  t.root += "-" + platf::new_file_lease();
+  ASSERT_TRUE(fs::create_directories(t.root / L"empty"));
+  std::ofstream(t.root / L"part") << "original";
+  t.task.assign(32, 'a');
+  ASSERT_EQ(t.capture(t.root), 204);
+  t.allow_replace = true;
+  auto files = nlohmann::json::parse(resume_manifest);
+  auto result = t.send("prepare", files.dump());
+  ASSERT_EQ(result.conflict, "file");
+  auto response = nlohmann::json::parse(result.id);
+  const auto conflicts = response.at("conflicts");
+  ASSERT_EQ(conflicts.size(), 2U);
+  response.erase("conflicts");
+  EXPECT_EQ(response, conflicts[0]);
+  EXPECT_EQ(conflicts[0].at("file"), 0);
+  EXPECT_NE(conflicts[0].at("version"), "");
+  EXPECT_EQ(conflicts[1].at("file"), 1);
+  EXPECT_EQ(conflicts[1].at("reason"), "folder");
+  EXPECT_EQ(conflicts[1].at("version"), "");
+  files[0]["resolution"] = conflicts[0].at("version");
+  files[1]["resolution"] = "skip";
+  std::ofstream(t.root / L"part") << "updated while choosing";
+  result = t.send("prepare", files.dump());
+  ASSERT_EQ(result.conflict, "file");
+  response = nlohmann::json::parse(result.id);
+  EXPECT_FALSE(response.contains("conflicts"));
+  EXPECT_EQ(response.at("file"), 0);
+  EXPECT_NE(response.at("version"), files[0].at("resolution"));
+  files[0]["resolution"] = "keep-both";
+  result = t.send("prepare", files.dump());
+  ASSERT_EQ(result.status, 200);
+  response = nlohmann::json::parse(result.id);
+  EXPECT_EQ(response.at("skipped"), nlohmann::json::array({1}));
+  t.lease = response.at("id").get<std::string>();
+  ASSERT_EQ(t.send("chunk", "abc").status, 204);
+  ASSERT_EQ(t.send("deliver").status, 204);
+  EXPECT_TRUE(fs::is_directory(t.root / L"empty"));
+  EXPECT_EQ(fs::file_size(t.root / L"part"), 22U);
+  EXPECT_EQ(fs::file_size(t.root / L"part (2)"), 3U);
+  EXPECT_EQ(fs::remove_all(t.root), 4U);
+}
+
+TEST(ClipboardResumeTest, RechecksLateAndChangedConflictsBeforePublishingTheRestOfABatch) {
+  resume_test_t t;
+  t.root += "-" + platf::new_file_lease();
+  ASSERT_TRUE(fs::create_directories(t.root));
+  t.task.assign(32, 'a');
+  ASSERT_EQ(t.capture(t.root), 204);
+  t.allow_replace = true;
+  const auto prepared = t.send("prepare", resume_manifest);
+  ASSERT_EQ(prepared.status, 200);
+  t.lease = nlohmann::json::parse(prepared.id).at("id").get<std::string>();
+  ASSERT_EQ(t.send("chunk", "abc").status, 204);
+  const auto path = t.root / L"empty";
+  std::ofstream(path) << "new";
+  auto collision = t.send("deliver");
+  ASSERT_EQ(collision.conflict, "file");
+  auto details = nlohmann::json::parse(collision.id);
+  EXPECT_EQ(details.at("file"), 1);
+  EXPECT_EQ(fs::file_size(t.root / L"part"), 3U);
+  nlohmann::json decision {{"file", 1}, {"resolution", details.at("version")}};
+  std::ofstream(path) << "changed";
+  collision = t.send("deliver", decision.dump());
+  ASSERT_EQ(collision.conflict, "file");
+  details = nlohmann::json::parse(collision.id);
+  EXPECT_NE(details.at("version"), decision.at("resolution"));
+  decision["resolution"] = details.at("version");
+  t.allow_replace = false;
+  collision = t.send("deliver", decision.dump());
+  ASSERT_EQ(collision.conflict, "file");
+  EXPECT_EQ(nlohmann::json::parse(collision.id).at("reason"), "permission");
+  EXPECT_EQ(fs::file_size(path), 7U);
+  ASSERT_TRUE(fs::remove(path));
+  ASSERT_TRUE(fs::create_directory(path));
+  collision = t.send("deliver");
+  ASSERT_EQ(collision.conflict, "file");
+  EXPECT_EQ(nlohmann::json::parse(collision.id).at("reason"), "folder");
+  EXPECT_EQ(t.send("deliver", R"({"file":9,"resolution":"skip"})").status, 400);
+  EXPECT_EQ(t.send("deliver", R"({"file":1,"resolution":"overwrite"})").status, 400);
+  decision["resolution"] = "skip";
+  ASSERT_EQ(t.send("deliver", decision.dump()).status, 204);
+  EXPECT_EQ(t.send("deliver", decision.dump()).status, 204);
+  EXPECT_TRUE(fs::is_directory(path));
+  EXPECT_FALSE(fs::exists(t.root / L"part (2)"));
+  EXPECT_EQ(fs::remove_all(t.root), 3U);
 }
 
 TEST(ClipboardResumeTest, RetainsACapturedFolderWhileItsStreamPreparesTheUpload) {

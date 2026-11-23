@@ -1299,10 +1299,12 @@ namespace platf {
     }
   }
 
-  void lock_workstation() {
+  bool lock_workstation() {
     if (!LockWorkStation()) {
       BOOST_LOG(warning) << "Windows did not accept the workstation lock request: " << GetLastError();
+      return false;
     }
+    return true;
   }
 
   void streaming_will_stop() {

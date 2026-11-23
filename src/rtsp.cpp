@@ -566,7 +566,7 @@ namespace rtsp_stream {
           if (pending && pending->id == pending_id) {
             launch_event.pop();
             BOOST_LOG(debug) << "Event timeout: "sv << pending->unique_id;
-            if (_session_slots->empty() && config::video.dd.configuration_option == config::video_t::dd_t::config_option_e::privacy_screen) {
+            if (_session_slots->empty() && pending->privacy_screen) {
               display_device::revert_configuration();
             }
           }
@@ -609,6 +609,38 @@ namespace rtsp_stream {
     bool session_pending() {
       std::lock_guard lock {launch_mutex};
       return static_cast<bool>(launch_event.view(0s));
+    }
+
+    /** @brief Check whether the certificate owns an active stream. */
+    bool has_running_session(std::string_view cert) {
+      if (cert.empty()) {
+        return false;
+      }
+      auto lg = _session_slots.lock();
+      return std::ranges::any_of(*_session_slots, [&](const auto &slot) {
+        return stream::session::state(*slot) == stream::session::state_e::RUNNING && stream::session::client_cert(*slot) == cert;
+      });
+    }
+
+    /** @brief Check active slots for a stream that requires privacy. */
+    bool has_private_session() {
+      auto lg = _session_slots.lock();
+      return std::ranges::any_of(*_session_slots, [](const auto &slot) {
+        return stream::session::requires_privacy(*slot);
+      });
+    }
+
+    /** @brief Match the stream to its TLS certificate and launch ID before updating its lock policy. */
+    std::optional<bool> update_disconnect_lock(std::string_view cert, std::string_view id, bool enabled) {
+      auto lg = _session_slots.lock();
+      for (const auto &slot : *_session_slots) {
+        if (!cert.empty() && stream::session::client_cert(*slot) == cert) {
+          if (auto result = stream::session::update_disconnect_lock(*slot, id, enabled); result.has_value()) {
+            return result;
+          }
+        }
+      }
+      return std::nullopt;
     }
 
     /** @brief Check both the paired TLS identity and the per-stream capability. */
@@ -694,7 +726,7 @@ namespace rtsp_stream {
       // 500ms to allow session cleanup to happen.
       if (session_count() > 0) {
         io_context.run_one_for(500ms);
-        if (config::video.dd.configuration_option == config::video_t::dd_t::config_option_e::privacy_screen && std::chrono::steady_clock::now() >= next_privacy_check) {
+        if (std::chrono::steady_clock::now() >= next_privacy_check && has_private_session()) {
           next_privacy_check = std::chrono::steady_clock::now() + 500ms;
           if (!display_device::privacy_screen_active()) {
             BOOST_LOG(warning) << "Ending private streams because the virtual display is no longer the only active output.";
@@ -751,6 +783,18 @@ namespace rtsp_stream {
     server.clear(false);
 
     return server.session_count();
+  }
+
+  bool has_running_session(std::string_view cert) {
+    return server.has_running_session(cert);
+  }
+
+  bool has_private_session() {
+    return server.has_private_session();
+  }
+
+  std::optional<bool> update_disconnect_lock(std::string_view cert, std::string_view id, bool enabled) {
+    return server.update_disconnect_lock(cert, id, enabled);
   }
 
   clipboard::formats_t clipboard_formats(std::string_view cert, std::string_view token) {
@@ -1308,7 +1352,7 @@ namespace rtsp_stream {
       respond(sock, session, &option, 454, "Session Not Found", req->sequenceNumber, {});
       return;
     }
-    if (config::video.dd.configuration_option == config::video_t::dd_t::config_option_e::privacy_screen && !display_device::privacy_screen_active()) {
+    if (session.privacy_screen && !display_device::privacy_screen_active()) {
       respond(sock, session, &option, 503, "Privacy screen unavailable", req->sequenceNumber, {});
       return;
     }

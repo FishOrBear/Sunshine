@@ -258,6 +258,51 @@ namespace win_clipboard {
       return true;
     }
 
+    /**
+     * @brief Remove a pinned tree in postorder. Reparse points are removed as links.
+     * @param path Path with its ancestors held against rename.
+     * @param handle Non-delete-sharing handle opened with DELETE and OPEN_REPARSE_POINT.
+     * @param attributes Attributes read from that handle.
+     * @param active Grant checked before each mutation.
+     * @param depth Current recursion depth.
+     * @return Win32 error code or ERROR_SUCCESS.
+     */
+    inline DWORD remove_tree(const fs::path &path, HANDLE handle, DWORD attributes, const std::function<bool()> &active, unsigned depth = 0) {
+      if (!active() || depth > 128) {
+        return ERROR_ACCESS_DENIED;
+      }
+      if ((attributes & FILE_ATTRIBUTE_DIRECTORY) && !(attributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+        std::error_code ec;
+        for (fs::directory_iterator it(path, ec), end; !ec && it != end; it.increment(ec)) {
+          const auto &child = it->path();
+          if (!valid_name(child.filename().native())) {
+            return ERROR_INVALID_NAME;
+          }
+          auto raw = CreateFileW(child.c_str(), DELETE | FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+          if (raw == INVALID_HANDLE_VALUE) {
+            return GetLastError();
+          }
+          file_handle pin(raw);
+          BY_HANDLE_FILE_INFORMATION info {};
+          if (!GetFileInformationByHandle(raw, &info)) {
+            return GetLastError();
+          }
+          const auto error = remove_tree(child, raw, info.dwFileAttributes, active, depth + 1);
+          if (error) {
+            return error;
+          }
+        }
+        if (ec) {
+          return ec.value();
+        }
+      }
+      if (!active()) {
+        return ERROR_ACCESS_DENIED;
+      }
+      FILE_DISPOSITION_INFO remove {TRUE};
+      return SetFileInformationByHandle(handle, FileDispositionInfo, &remove, sizeof(remove)) ? ERROR_SUCCESS : GetLastError();
+    }
+
     /** @brief Clean up expired batches and bound the number of retained paste sources. */
     inline void expire_batches(const fs::path &root, const fs::path &current, size_t keep = 16) {
       const auto cutoff = fs::file_time_type::clock::now() - std::chrono::hours(24);
@@ -282,15 +327,16 @@ namespace win_clipboard {
           ++retained;
           continue;
         }
-        std::error_code batch_error;
-        const fs::directory_iterator end;
-        for (fs::directory_iterator item(path, batch_error); !batch_error && item != end; item.increment(batch_error)) {
-          const auto child_attrs = GetFileAttributesW(item->path().c_str());
-          if (child_attrs != INVALID_FILE_ATTRIBUTES && !(child_attrs & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))) {
-            DeleteFileW(item->path().c_str());
+        auto raw = CreateFileW(path.c_str(), DELETE | FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        if (raw != INVALID_HANDLE_VALUE) {
+          file_handle pin(raw);
+          BY_HANDLE_FILE_INFORMATION info {};
+          if (GetFileInformationByHandle(raw, &info) && (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && !(info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+            remove_tree(path, raw, info.dwFileAttributes, [] {
+              return true;
+            });
           }
         }
-        RemoveDirectoryW(path.c_str());
       }
     }
 

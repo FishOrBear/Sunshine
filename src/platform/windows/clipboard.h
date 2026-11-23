@@ -18,6 +18,13 @@ namespace platf {
   /** @brief Allocate upload state with the lifetime of one paired stream. */
   std::shared_ptr<file_browser_session_t> make_file_browser_session();
 
+#ifdef SUNSHINE_TESTS
+  namespace test_support {
+    /** @brief Simulate loss of the interactive desktop for one grant without locking the test machine. */
+    void lock_file_session(file_browser_session_t &session);
+  }  // namespace test_support
+#endif
+
   /** @brief Refresh the capture geometry used to resolve file drops for this stream. */
   void set_file_drag_display(file_browser_session_t &session, int left, int top, int width, int height, int stream_width, int stream_height);
 
@@ -43,8 +50,8 @@ namespace platf {
     std::string task {};  ///< Canonical task selected for a captured paste gesture.
   };
 
-  /** @brief Execute a file-batch operation under the interactive user's token. */
-  clipboard_upload_result_t exchange_clipboard_batch(clipboard_upload_session_t &session, std::string_view op, std::string_view id, std::uint32_t file, std::uint64_t offset, std::optional<std::uint32_t> since, std::string_view input, const std::function<bool()> &grant_active, std::string_view task = {}, std::string_view previous = {});
+  /** @brief Execute a file-batch operation under the interactive user's token; allow_replace gates conditional Explorer replacements. */
+  clipboard_upload_result_t exchange_clipboard_batch(clipboard_upload_session_t &session, std::string_view op, std::string_view id, std::uint32_t file, std::uint64_t offset, std::optional<std::uint32_t> since, std::string_view input, const std::function<bool()> &grant_active, std::string_view task = {}, std::string_view previous = {}, bool allow_replace = false);
 
   /** @brief Return the clipboard sequence at stream startup without retrieving its contents. */
   std::uint32_t clipboard_sequence();
@@ -57,6 +64,7 @@ namespace platf {
     std::uint64_t offset {};
     std::shared_ptr<clipboard_upload_session_t> offer_source {};  ///< Set by the server from the active stream grant.
     bool metadata_only {};  ///< Publish file identities without retaining any open files.
+    bool folders {};  ///< Client accepts directory entries and validated relative paths.
   };
 
   // Only read handles already pinned at paste time. No clipboard access or path lookup.

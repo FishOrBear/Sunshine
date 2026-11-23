@@ -14,6 +14,7 @@
 // platform includes
 #include <Audioclient.h>
 #include <avrt.h>
+#include <endpointvolume.h>
 #include <mmdeviceapi.h>
 #include <newdev.h>
 #include <roapi.h>
@@ -1603,6 +1604,36 @@ namespace platf::audio {
 }  // namespace platf::audio
 
 namespace platf {
+
+  std::optional<bool> host_audio_mute(std::optional<bool> desired) {
+    const auto init = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (FAILED(init) && init != RPC_E_CHANGED_MODE) {
+      return std::nullopt;
+    }
+    auto uninit = util::fail_guard([init] {
+      if (SUCCEEDED(init)) {
+        CoUninitialize();
+      }
+    });
+
+    audio::device_enum_t enumerator;
+    if (FAILED(CoCreateInstance(CLSID_MMDeviceEnumerator, nullptr, CLSCTX_INPROC_SERVER, IID_IMMDeviceEnumerator, (void **) &enumerator))) {
+      return std::nullopt;
+    }
+    auto device = audio::default_device(enumerator);
+    util::safe_ptr<IAudioEndpointVolume, &audio::Release<IAudioEndpointVolume>> volume;
+    if (!device || FAILED(device->Activate(IID_IAudioEndpointVolume, CLSCTX_INPROC_SERVER, nullptr, (void **) &volume))) {
+      return std::nullopt;
+    }
+    if (desired && FAILED(volume->SetMute(*desired, nullptr))) {
+      return std::nullopt;
+    }
+    BOOL muted = FALSE;
+    if (FAILED(volume->GetMute(&muted))) {
+      return std::nullopt;
+    }
+    return muted != FALSE;
+  }
 
   // It's not big enough to justify it's own source file :/
   namespace dxgi {

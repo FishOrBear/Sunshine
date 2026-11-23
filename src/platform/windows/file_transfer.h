@@ -110,24 +110,19 @@ namespace platf::file_transfer {
     return 200;
   }
 
-  /** @brief Read a single chunk while checking the listing's size and modification time. */
-  inline int read_file(const fs::path &path, std::uint64_t offset, std::uint64_t size, std::optional<std::int64_t> modified, std::string &output) {
+  /** @brief Read one bounded chunk from an already opened source, including a retried offset. */
+  inline int read_chunk(HANDLE file, std::uint64_t offset, std::uint64_t size, std::string &output) {
     if (offset > size || size > static_cast<std::uint64_t>((std::numeric_limits<LONGLONG>::max)())) {
       return 400;
     }
-    file_handle file;
-    const int status = open_source(path, size, modified, file);
-    if (status != 200) {
-      return status;
-    }
     LARGE_INTEGER position;
     position.QuadPart = static_cast<LONGLONG>(offset);
-    if (!SetFilePointerEx(file.get(), position, nullptr, FILE_BEGIN)) {
+    if (!SetFilePointerEx(file, position, nullptr, FILE_BEGIN)) {
       return file_error();
     }
     std::string chunk(static_cast<size_t>((std::min) (chunk_size, size - offset)), '\0');
     DWORD bytes {};
-    if (!chunk.empty() && !ReadFile(file.get(), chunk.data(), static_cast<DWORD>(chunk.size()), &bytes, nullptr)) {
+    if (!chunk.empty() && !ReadFile(file, chunk.data(), static_cast<DWORD>(chunk.size()), &bytes, nullptr)) {
       return file_error();
     }
     if (bytes != chunk.size()) {
@@ -135,6 +130,13 @@ namespace platf::file_transfer {
     }
     output = std::move(chunk);
     return 200;
+  }
+
+  /** @brief Serve a legacy by-path read after checking the listing's size and modification time. */
+  inline int read_file(const fs::path &path, std::uint64_t offset, std::uint64_t size, std::optional<std::int64_t> modified, std::string &output) {
+    file_handle file;
+    const auto status = open_source(path, size, modified, file);
+    return status == 200 ? read_chunk(file.get(), offset, size, output) : status;
   }
 
   /** @brief Set or clear delete-on-close on the staging handle. */
@@ -223,19 +225,29 @@ namespace platf::file_transfer {
     std::uint64_t offset {};
     file_handle file;
     file_digest_t hash;
+    bool pinned_read {};  ///< Keep this exact handle for reads after hashing.
+    std::string result;  ///< Completed identity response for a retried request.
     std::chrono::steady_clock::time_point touched;
   };
 
-  /** @brief Hash at most 8 MiB before yielding the HTTPS worker back to other clients. */
-  inline int source_identity(std::map<std::string, identity_job_t> &jobs, const std::string &id, const fs::path &path, std::uint64_t size, std::optional<std::int64_t> modified, std::string &output, const std::function<bool()> &active) {
+  /** @brief Hash at most 8 MiB per request. Opening a new source requires permission to start a transfer. */
+  inline int source_identity(std::map<std::string, identity_job_t> &jobs, const std::string &id, const fs::path &path, std::uint64_t size, std::optional<std::int64_t> modified, std::string &output, const std::function<bool()> &active, bool pinned_read = false, bool can_start_transfer = true) {
     const auto now = std::chrono::steady_clock::now();
     std::erase_if(jobs, [&](const auto &job) {
       return now - job.second.touched >= file_resume_lifetime;
     });
     auto iter = jobs.find(id);
     if (iter == jobs.end()) {
+      if (!can_start_transfer) {
+        return 403;
+      }
       if (jobs.size() >= 8) {
         return 429;
+      }
+      std::vector<file_handle> parents;
+      const auto pinned = pin_directory(path.parent_path(), parents);
+      if (pinned != 200) {
+        return pinned;
       }
       identity_job_t job;
       const auto status = open_source(path, size, modified, job.file);
@@ -248,13 +260,18 @@ namespace platf::file_transfer {
       job.path = path;
       job.size = size;
       job.modified = modified;
+      job.pinned_read = pinned_read;
       iter = jobs.emplace(id, std::move(job)).first;
     }
     auto &job = iter->second;
-    if (job.path != path || job.size != size || job.modified != modified) {
+    if (job.path != path || job.size != size || job.modified != modified || job.pinned_read != pinned_read) {
       return 409;
     }
     job.touched = now;
+    if (!job.result.empty()) {
+      output = job.result;
+      return 200;
+    }
     const auto count = (std::min) (size - job.offset, 8 * chunk_size);
     const auto end = job.offset + count;
     std::string buffer(static_cast<std::size_t>((std::min) (count, chunk_size)), '\0');
@@ -280,12 +297,39 @@ namespace platf::file_transfer {
       return 202;
     }
     const auto sha = job.hash.finish();
-    jobs.erase(iter);
     if (sha.empty()) {
+      jobs.erase(iter);
       return 500;
     }
     output = nlohmann::json({{"sha256", sha}, {"size", std::to_string(size)}}).dump();
+    if (pinned_read) {
+      job.result = output;
+    } else {
+      jobs.erase(iter);
+    }
     return 200;
+  }
+
+  /** @brief Read only the handle that completed identification for this task in this file session. */
+  inline int read_pinned_source(std::map<std::string, identity_job_t> &jobs, const std::string &id, const fs::path &path, std::uint64_t offset, std::uint64_t size, std::optional<std::int64_t> modified, std::string &output) {
+    const auto it = jobs.find(id);
+    if (it == jobs.end()) {
+      return 404;
+    }
+    auto &job = it->second;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - job.touched >= file_resume_lifetime) {
+      jobs.erase(it);
+      return 404;
+    }
+    if (!job.pinned_read || job.result.empty() || job.path != path || job.size != size || job.modified != modified) {
+      return 409;
+    }
+    const auto status = read_chunk(job.file.get(), offset, size, output);
+    if (status == 200) {
+      job.touched = now;
+    }
+    return status;
   }
 
   /** @brief Identify the published file for a retried acknowledgement without keeping it locked. */
@@ -338,30 +382,44 @@ namespace platf::file_transfer {
       expire_locked(now);
     }
 
-    /** @brief Process one validated transfer under the active desktop user's security context. */
-    int exchange(std::string_view operation, std::string_view cert, LUID logon, std::uint64_t session, const fs::path &path, const std::string &id, std::string_view sha, std::uint64_t offset, std::uint64_t size, std::string_view bytes, std::vector<file_handle> &pins, std::string &output, std::optional<std::uint64_t> &ack, const std::function<bool()> &active, std::string_view replace = {}) {
+    /** @brief Bind an authorized upload or continue its lease under the same user's security context. */
+    int exchange(std::string_view operation, std::string_view cert, LUID logon, std::uint64_t session, const fs::path &path, const std::string &id, std::string_view sha, std::uint64_t offset, std::uint64_t size, std::string_view bytes, std::string &output, std::optional<std::uint64_t> &ack, const std::function<bool()> &active, std::string_view replace = {}, bool can_start_transfer = true) {
       std::lock_guard guard(mutex);
       if (cert.empty() || !session || !active()) {
         return 403;
       }
       const auto now = clock::now();
       expire_locked(now);
-      const bool bind = operation == "resume" || operation == "discard";
+      const bool prepare = operation == "prepare-upload";
+      const bool bind = prepare || operation == "resume" || operation == "discard";
       auto it = std::ranges::find_if(records, [&](const record_t &r) {
         return r.cert == cert && r.logon.LowPart == logon.LowPart && r.logon.HighPart == logon.HighPart && (bind ? r.task == id : r.lease == id);
       });
       if (bind) {
-        if (!file_digest_t::valid(sha)) {
+        if (!(sha.empty() && (prepare || operation == "discard")) && !file_digest_t::valid(sha)) {
           return 400;
+        }
+        if (!can_start_transfer && (it == records.end() || it->session != session)) {
+          return 403;
         }
         if (it != records.end() && it->session > session) {
           return 403;
         }
         if (operation == "discard") {
-          if (it != records.end() && it->path == path && it->sha == sha) {
+          if (it != records.end() && it->path == path && (it->sha.empty() ? it->session == session : it->sha == sha)) {
             records.erase(it);
           }
           return 204;
+        }
+        if (it != records.end() && (it->path != path || it->size != size || it->replace != replace || (!it->sha.empty() && it->sha != sha))) {
+          return 409;
+        }
+        std::vector<file_handle> pins;
+        if (it == records.end() || !it->file) {
+          const auto pinned = pin_directory(path.parent_path(), pins);
+          if (pinned != 200) {
+            return pinned;
+          }
         }
         if (it == records.end()) {
           if (std::ranges::count_if(records, [](const record_t &r) {
@@ -395,12 +453,20 @@ namespace platf::file_transfer {
           r.logon = logon;
           r.path = path;
           r.size = size;
-          r.sha = sha;
           r.replace = replace;
           r.pins = std::move(pins);
           it = records.insert(records.end(), std::move(r));
-        } else if (it->path != path || it->size != size || it->sha != sha || it->replace != replace || (!it->file && !same_destination(*it))) {
+        } else if (!it->file && !same_destination(*it)) {
           return 409;
+        }
+        it->sha = sha;
+        it->touched = now;
+        if (prepare) {
+          if (it->session != session) {
+            it->lease.clear();
+          }
+          it->session = session;
+          return 204;
         }
         const auto lease = new_file_lease();
         if (lease.empty()) {
@@ -408,7 +474,6 @@ namespace platf::file_transfer {
         }
         it->lease = lease;
         it->session = session;
-        it->touched = now;
         output = nlohmann::json({{"id", lease}, {"offset", std::to_string(it->offset)}, {"complete", !it->file}}).dump();
         return 200;
       }
@@ -447,6 +512,13 @@ namespace platf::file_transfer {
       if (it->replace != replace) {
         return 409;
       }
+      // A receipt releases its directory handles. Revalidate only the bound destination,
+      // including on a replay, after checking the certificate, logon, session and lease.
+      std::vector<file_handle> parents;
+      const auto pinned = pin_directory(it->path.parent_path(), parents);
+      if (pinned != 200) {
+        return pinned;
+      }
       if (!it->file) {
         return same_destination(*it) ? 204 : 409;
       }
@@ -462,13 +534,13 @@ namespace platf::file_transfer {
         records.erase(it);
         return before ? 403 : 500;
       }
-      const auto status = publish_file(it->file.get(), path, replace);
+      const auto status = publish_file(it->file.get(), it->path, it->replace);
       if (status != 204) {
         records.erase(it);
         return status;
       }
       it->file.reset();
-      it->receipt = inspect_path(path);
+      it->receipt = inspect_path(it->path);
       it->pins.clear();
       it->touched = now;
       if (!it->receipt || it->receipt->volume != before->volume || it->receipt->index != before->index || it->receipt->size != it->size) {

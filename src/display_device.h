@@ -68,13 +68,20 @@ namespace display_device {
    */
   [[nodiscard]] std::unique_ptr<DisplayPowerGuardInterface> keep_display_awake(const std::string &reason);
 
+  /** @brief Outcome of preparing the display for a new streaming session. */
+  enum class configuration_result_e {
+    ready,  ///< Streaming can proceed.
+    privacy_unavailable,  ///< A safe virtual-only topology could not be established.
+    privacy_api_unavailable,  ///< Windows temporarily disallows display changes.
+  };
+
   /**
    * @brief Configure the display device based on the user configuration and the session information.
    * @note This is a convenience method for calling similar method of a different signature.
    *
    * @param video_config User's video related configuration.
    * @param session Session information.
-   * @return False when required privacy screen preparation failed and streaming must be refused.
+   * @return Whether streaming can proceed or why privacy screen preparation failed.
    *
    * @examples
    * const std::shared_ptr<rtsp_stream::launch_session_t> launch_session;
@@ -83,7 +90,7 @@ namespace display_device {
    * configure_display(video_config, *launch_session);
    * @examples_end
    */
-  [[nodiscard]] bool configure_display(const config::video_t &video_config, const rtsp_stream::launch_session_t &session);
+  [[nodiscard]] configuration_result_e configure_display(const config::video_t &video_config, const rtsp_stream::launch_session_t &session);
 
   /**
    * @brief Check whether the active Windows display topology has a single indirect virtual target.

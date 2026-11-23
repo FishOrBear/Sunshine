@@ -5,10 +5,11 @@
 #pragma once
 
 #include "clipboard.h"
+#include "clipboard_tree.h"
 #include "file_transfer.h"
 
 namespace platf {
-  /** @brief A stream-scoped snapshot of regular files copied by the interactive user. */
+  /** @brief A stream-scoped snapshot of the files and directories copied by the interactive user. */
   struct clipboard_download_t {
     /** @brief A read handle to the original file that permits renaming and deletion. */
     struct file_t {
@@ -19,6 +20,7 @@ namespace platf {
     struct offered_file_t {
       std::filesystem::path path;
       BY_HANDLE_FILE_INFORMATION identity;
+      std::string name;  ///< Relative wire name retained for an independent paste.
     };
 
     /// File identities retained until the next selection on this stream.
@@ -32,7 +34,7 @@ namespace platf {
     std::chrono::steady_clock::time_point last_read {};
 
     /** @brief Open the selected files. Return an empty optional to inspect other formats. */
-    std::optional<int> begin(DWORD since, DWORD initial, DWORD &current, LUID owner, std::string &output, bool metadata_only = false) {
+    std::optional<int> begin(DWORD since, DWORD initial, DWORD &current, LUID owner, std::string &output, bool metadata_only = false, bool folders = false) {
       files.clear();
       std::vector<std::filesystem::path> paths;
       {
@@ -57,43 +59,30 @@ namespace platf {
         }
         paths = win_clipboard::detail::file_paths(drop, count);
       }
-      return pin(paths, current, owner, output, metadata_only);
+      return pin(paths, current, owner, output, metadata_only, folders);
     }
 
     /** @brief Snapshot file identities, retaining read handles only for clients requesting a readable lease. */
-    int pin(const std::vector<std::filesystem::path> &paths, DWORD current, LUID owner, std::string &output, bool metadata_only) {
-      if (paths.empty()) {
-        return 204;
-      }
+    int pin(const std::vector<std::filesystem::path> &paths, DWORD current, LUID owner, std::string &output, bool metadata_only, bool folders = false) {
       std::vector<file_t> pinned;
       std::vector<offered_file_t> selected;
       auto manifest = nlohmann::json::array();
-      for (const auto &path : paths) {
-        std::vector<file_transfer::file_handle> parents;
-        const auto name = path.filename().native();
-        if (!win_clipboard::detail::valid_name(name) || file_transfer::pin_directory(path.parent_path(), parents) != 200) {
-          return 204;
-        }
-        std::error_code error;
-        const auto size = std::filesystem::file_size(path, error);
-        if (error) {
-          return 204;
-        }
-        file_t file {{}, size};
-        const DWORD share = FILE_SHARE_READ | FILE_SHARE_DELETE;
-        const int status = file_transfer::open_source(path, size, {}, file.handle, metadata_only ? FILE_READ_ATTRIBUTES : GENERIC_READ, metadata_only ? share | FILE_SHARE_WRITE : share);
-        if (status != 200) {
-          return status == 409 ? 409 : 204;
-        }
-        BY_HANDLE_FILE_INFORMATION identity {};
-        if (!GetFileInformationByHandle(file.handle.get(), &identity)) {
-          return 500;
-        }
-        selected.push_back({path, identity});
+      const int status = win_clipboard::tree::walk(paths, folders, metadata_only, [&](const auto &path, const auto &name, const auto &identity, auto &handle) {
+        const bool directory = (identity.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        const auto size = directory ? 0 : (static_cast<std::uint64_t>(identity.nFileSizeHigh) << 32) | identity.nFileSizeLow;
+        selected.push_back({path, identity, win_clipboard::detail::to_utf8(name)});
         if (!metadata_only) {
-          pinned.emplace_back(std::move(file));
+          pinned.push_back({directory ? nullptr : std::move(handle), size});
         }
-        manifest.push_back({{"name", win_clipboard::detail::to_utf8(name)}, {"size", std::to_string(size)}});
+        manifest.push_back({{"name", selected.back().name}, {"size", std::to_string(size)}});
+      });
+      if (status != 200) {
+        return status;
+      }
+      const auto id = std::to_string(lease + 1);
+      auto packet = "M" + nlohmann::json({{"lease", id}, {"offer", id}, {"metadataOnly", metadata_only}, {"files", std::move(manifest)}}).dump();
+      if (packet.size() > win_clipboard::tree::max_manifest) {
+        return 413;
       }
       if (current != GetClipboardSequenceNumber()) {
         return 409;
@@ -104,7 +93,7 @@ namespace platf {
       offered = std::move(selected);
       last_read = std::chrono::steady_clock::now();
       ++lease;
-      output = "M" + nlohmann::json({{"lease", std::to_string(lease)}, {"offer", std::to_string(lease)}, {"metadataOnly", metadata_only}, {"files", std::move(manifest)}}).dump();
+      output = std::move(packet);
       return 200;
     }
 
@@ -115,15 +104,17 @@ namespace platf {
       }
       std::vector<file_t> pinned;
       auto manifest = nlohmann::json::array();
-      for (const auto &[path, original] : offered) {
+      for (const auto &[path, original, name] : offered) {
         std::vector<file_transfer::file_handle> parents;
         auto status = file_transfer::pin_directory(path.parent_path(), parents);
         if (status != 200) {
           return status;
         }
-        const auto size = (static_cast<std::uint64_t>(original.nFileSizeHigh) << 32) | original.nFileSizeLow;
+        const bool directory = (original.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        const auto size = directory ? 0 : (static_cast<std::uint64_t>(original.nFileSizeHigh) << 32) | original.nFileSizeLow;
         file_t file {{}, size};
-        status = file_transfer::open_source(path, size, {}, file.handle, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE);
+        status = directory ? (win_clipboard::tree::pin_folder(path, file.handle) ? 200 : 409) :
+                             file_transfer::open_source(path, size, {}, file.handle, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE);
         if (status != 200) {
           return status;
         }
@@ -134,8 +125,11 @@ namespace platf {
         if (current.dwVolumeSerialNumber != original.dwVolumeSerialNumber || current.nFileIndexHigh != original.nFileIndexHigh || current.nFileIndexLow != original.nFileIndexLow || CompareFileTime(&current.ftCreationTime, &original.ftCreationTime) || CompareFileTime(&current.ftLastWriteTime, &original.ftLastWriteTime)) {
           return 409;
         }
+        if (directory) {
+          file.handle.reset();
+        }
         pinned.emplace_back(std::move(file));
-        manifest.push_back({{"name", win_clipboard::detail::to_utf8(path.filename().native())}, {"size", std::to_string(size)}});
+        manifest.push_back({{"name", name}, {"size", std::to_string(size)}});
       }
       destination.revision = revision;
       destination.logon = owner;

@@ -10,6 +10,7 @@
   #include <fstream>
 
   // local includes
+  #include "src/platform/windows/clipboard.h"
   #include "src/platform/windows/file_transfer.h"
 
   // Win32 IOCTL definitions require the Windows types supplied by file_transfer.h.
@@ -32,6 +33,7 @@ namespace {
     std::uint64_t session = 1;
     std::optional<std::uint64_t> ack;
     bool active = true;
+    bool can_start_transfer = true;
     std::string replace;
 
     transfer_test_t() {
@@ -47,12 +49,12 @@ namespace {
     int call(std::string_view op, std::uint64_t offset = 0, std::string_view bytes = {}, std::string_view sha = abc_sha, std::uint64_t size = 3) {
       output.clear();
       ack.reset();
-      const bool bind = op == "resume" || op == "discard";
-      std::vector<files::file_handle> pins;
-      const int status = store.exchange(op, cert, logon, session, destination, bind ? task : lease, sha, offset, size, bytes, pins, output, ack, [&] {
+      const bool bind = op == "prepare-upload" || op == "resume" || op == "discard";
+      const int status = store.exchange(op, cert, logon, session, destination, bind ? task : lease, sha, offset, size, bytes, output, ack, [&] {
         return active;
       },
-                                        op == "resume" || op == "commit" ? replace : "");
+                                        op == "prepare-upload" || op == "resume" || op == "commit" ? replace : "",
+                                        can_start_transfer);
       if (op == "resume" && status == 200) {
         lease = nlohmann::json::parse(output)["id"].get<std::string>();
       }
@@ -201,6 +203,143 @@ TEST(StandaloneFileTransferTest, PollsContentHashAndDetectsChangesWithIdenticalS
   ASSERT_EQ(identify(), 202);
   ASSERT_EQ(identify(), 200);
   EXPECT_NE(first, nlohmann::json::parse(t.output)["sha256"]);
+}
+
+TEST(StandaloneFileTransferTest, KeepsOnlyTheReservedUploadWhenNewTransfersAreDenied) {
+  transfer_test_t t;
+  ASSERT_EQ(t.call("prepare-upload", 0, {}, {}), 204);
+  t.can_start_transfer = false;
+  const auto destination = t.destination;
+  t.destination = t.directory / "another.bin";
+  EXPECT_EQ(t.call("resume"), 409);
+  t.destination = destination;
+  EXPECT_EQ(t.call("resume", 0, {}, abc_sha, 2), 409);
+  t.replace = "other-version";
+  EXPECT_EQ(t.call("resume"), 409);
+  t.replace.clear();
+  ++t.session;
+  EXPECT_EQ(t.call("prepare-upload", 0, {}, {}), 403);
+  EXPECT_EQ(t.call("resume"), 403);
+  EXPECT_EQ(t.call("discard", 0, {}, {}), 403);
+  --t.session;
+  ASSERT_EQ(t.call("prepare-upload", 0, {}, {}), 204);
+  ASSERT_EQ(t.call("resume"), 200);
+  EXPECT_EQ(t.call("resume", 0, {}, empty_sha), 409);
+  ASSERT_EQ(t.call("chunk", 0, "ab"), 204);
+  EXPECT_EQ(t.call("discard", 0, {}, {}), 204);
+  ASSERT_EQ(t.call("chunk", 2, "c"), 204);
+  ASSERT_EQ(t.call("commit"), 204);
+  ASSERT_EQ(t.call("commit"), 204);
+  std::string content;
+  std::ifstream(t.destination) >> content;
+  EXPECT_EQ(content, "abc");
+  t.task = platf::new_file_lease();
+  EXPECT_EQ(t.call("prepare-upload", 0, {}, {}), 403);
+  EXPECT_EQ(t.call("resume"), 403);
+  t.can_start_transfer = true;
+  t.destination = t.directory / "cancelled.bin";
+  ASSERT_EQ(t.call("prepare-upload", 0, {}, {}), 204);
+  t.can_start_transfer = false;
+  ASSERT_EQ(t.call("discard", 0, {}, {}), 204);
+  EXPECT_EQ(t.call("resume"), 403);
+  EXPECT_EQ(std::distance(fs::directory_iterator(t.directory), fs::directory_iterator()), 1);
+}
+
+TEST(StandaloneFileTransferTest, HashesAndReadsOnlyThePinnedFileWhenNewTransfersAreDenied) {
+  transfer_test_t t;
+  const std::string contents(8 * files::chunk_size + 1, 'b');
+  ASSERT_TRUE(std::ofstream(t.destination, std::ios::binary).write(contents.data(), contents.size()));
+  std::map<std::string, files::identity_job_t> jobs;
+  const auto identify = [&](const std::string &id, bool can_start_transfer) {
+    return files::source_identity(jobs, id, t.destination, contents.size(), {}, t.output, [] {
+      return true;
+    },
+                                  true,
+                                  can_start_transfer);
+  };
+  const auto read = [&](const std::string &id, const fs::path &path, std::uint64_t offset, std::optional<std::int64_t> stamp = {}) {
+    return files::read_pinned_source(jobs, id, path, offset, contents.size(), stamp, t.output);
+  };
+  EXPECT_EQ(identify(t.task, false), 403);
+  ASSERT_EQ(identify(t.task, true), 202);
+  EXPECT_EQ(read(t.task, t.destination, 0), 409);
+  ASSERT_EQ(identify(t.task, false), 200);
+  const auto identity = t.output;
+  ASSERT_EQ(identify(t.task, false), 200);
+  EXPECT_EQ(t.output, identity);
+  platf::file_digest_t hash;
+  ASSERT_TRUE(hash.start());
+  ASSERT_TRUE(hash.update(contents));
+  EXPECT_EQ(nlohmann::json::parse(identity).at("sha256"), hash.finish());
+  EXPECT_FALSE(std::ofstream(t.destination).is_open());
+  EXPECT_EQ(read(platf::new_file_lease(), t.destination, 0), 404);
+  EXPECT_EQ(read(t.task, t.directory / "other.bin", 0), 409);
+  EXPECT_EQ(read(t.task, t.destination, 0, 1), 409);
+  EXPECT_EQ(read(t.task, t.destination, contents.size() + 1), 400);
+  ASSERT_EQ(read(t.task, t.destination, contents.size() - 1), 200);
+  EXPECT_EQ(t.output, "b");
+  ASSERT_EQ(read(t.task, t.destination, 0), 200);
+  EXPECT_EQ(t.output, contents.substr(0, files::chunk_size));
+  jobs.at(t.task).touched -= platf::file_resume_lifetime;
+  EXPECT_EQ(read(t.task, t.destination, 0), 404);
+  EXPECT_EQ(identify(t.task, false), 403);
+  EXPECT_TRUE(std::ofstream(t.destination).is_open());
+}
+
+TEST(StandaloneFileTransferTest, StartsUploadsAndDownloadsInANewLockedFileSession) {
+  transfer_test_t t;
+  auto session = platf::make_file_browser_session();
+  const auto op = [&](std::string_view action, const fs::path &path, const std::string &id, std::string_view sha = {}, std::string_view body = {}) {
+    t.output.clear();
+    return platf::exchange_files(*session, action, win_clipboard::detail::to_utf8(path.generic_wstring()), id, 0, 3, {}, body, t.output, [&] {
+      return t.active;
+    },
+                                 t.cert,
+                                 sha,
+                                 nullptr,
+                                 true);
+  };
+  ASSERT_EQ(op("capabilities", {}, {}), 200);
+  ASSERT_TRUE(nlohmann::json::parse(t.output).at("backgroundTransfers").get<bool>());
+  const auto status = op("list", t.directory, {});
+  if (status == 403) {
+    GTEST_SKIP() << "A signed-in Windows shell is required to test file access";
+  }
+  ASSERT_EQ(status, 200);
+  session = platf::make_file_browser_session();
+  platf::test_support::lock_file_session(*session);
+  ASSERT_EQ(op("places", {}, {}), 200);
+  ASSERT_EQ(op("list", t.directory, {}), 200);
+  ASSERT_EQ(op("mkdir", t.directory / "folder", {}), 204);
+  ASSERT_EQ(op("folder-path", t.directory / "folder", {}), 200);
+  const auto source = t.directory / "source";
+  ASSERT_TRUE(std::ofstream(source) << "abc");
+  const auto read_id = platf::new_file_lease();
+  ASSERT_EQ(op("open-read", source, read_id), 200);
+  ASSERT_EQ(op("prepare-upload", t.destination, t.task), 204);
+  for (auto action : {"drag-source", "drop-target", "delete", "rmdir"}) {
+    EXPECT_EQ(op(action, source, read_id), 403) << action;
+  }
+  const auto other_id = platf::new_file_lease();
+  EXPECT_EQ(op("read-pinned", source, other_id), 404);
+  EXPECT_EQ(op("read-pinned", t.destination, read_id), 409);
+  t.active = false;
+  EXPECT_EQ(op("read-pinned", source, read_id), 403);
+  EXPECT_EQ(op("resume", t.destination, t.task, abc_sha), 403);
+  t.active = true;
+  ASSERT_EQ(op("read-pinned", source, read_id), 200);
+  EXPECT_EQ(t.output, "abc");
+  ASSERT_EQ(op("resume", t.destination, t.task, abc_sha), 200);
+  const auto lease = nlohmann::json::parse(t.output).at("id").get<std::string>();
+  EXPECT_EQ(op("chunk", t.directory / "other", lease, {}, "abc"), 404);
+  ASSERT_EQ(op("chunk", t.destination, lease, {}, "abc"), 204);
+  ASSERT_EQ(op("commit", t.destination, lease), 204);
+  ASSERT_EQ(op("abort", {}, read_id), 204);
+  EXPECT_EQ(op("read-pinned", source, read_id), 404);
+  EXPECT_TRUE(std::ofstream(source).is_open());
+  std::string content;
+  std::ifstream(t.destination) >> content;
+  EXPECT_EQ(content, "abc");
 }
 
 TEST(StandaloneFileTransferTest, ReadsPastFourGiBWithoutTruncatingOffsets) {

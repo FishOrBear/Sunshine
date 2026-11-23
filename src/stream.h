@@ -55,19 +55,19 @@ namespace stream {
     public:
       /**
        * @brief Register a newly started stream.
-       * @param lock_on_disconnect Whether the stream requests a workstation lock.
        * @return True when this is the first active stream.
        */
-      [[nodiscard]] bool start(bool lock_on_disconnect) {
-        pending_lock |= lock_on_disconnect;
+      [[nodiscard]] bool start() {
         return ++active == 1;
       }
 
       /**
        * @brief Unregister a stream that has finished teardown.
+       * @param lock_on_disconnect Whether the disconnecting stream requests a workstation lock.
        * @return Empty while other streams remain, otherwise whether a lock was requested.
        */
-      [[nodiscard]] std::optional<bool> finish() {
+      [[nodiscard]] std::optional<bool> finish(bool lock_on_disconnect) {
+        pending_lock |= lock_on_disconnect;
         if (--active != 0) {
           return std::nullopt;
         }
@@ -131,6 +131,12 @@ namespace stream {
      * @return PEM certificate associated with the session's client.
      */
     const std::string &client_cert(session_t &session);
+
+    /** @brief Check whether this session requires privacy-screen topology. */
+    bool requires_privacy(const session_t &session);
+
+    /** @brief Update the lock policy if the requested session is still running. */
+    std::optional<bool> update_disconnect_lock(session_t &session, std::string_view id, bool enabled);
 
     /** @brief Get the immutable clipboard capability associated with a session. */
     const clipboard::grant_t &clipboard_grant(const session_t &session);

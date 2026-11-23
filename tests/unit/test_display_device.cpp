@@ -28,7 +28,7 @@
   #include <display_device/windows/win_api_layer.h>
 
 namespace display_device {
-  bool has_privacy_target(const WinApiLayerInterface &api, QueryType type, const std::string &device_id);
+  bool has_privacy_target(const WinApiLayerInterface &api, QueryType type, const std::string &device_id, bool (*is_parsec_adapter)(const DISPLAYCONFIG_PATH_INFO &));
 }
 #endif
 
@@ -95,13 +95,31 @@ TEST_P(ParseDeviceId, IntegrationTest) {
 TEST(PrivateDisplayTests, RequiresAnExplicitOutput) {
   config::video_t video_config {};
   video_config.dd.configuration_option = config_option_e::privacy_screen;
-  EXPECT_FALSE(display_device::configure_display(video_config, {}));
+  EXPECT_EQ(display_device::configure_display(video_config, {}), display_device::configuration_result_e::privacy_unavailable);
   video_config.output_name = "{virtual-device-id}";
   const auto result = display_device::parse_configuration(video_config, {});
   const auto *config = std::get_if<display_device::SingleDisplayConfiguration>(&result);
   ASSERT_NE(config, nullptr);
   EXPECT_EQ(config->m_device_id, video_config.output_name);
   EXPECT_EQ(config->m_device_prep, device_prep_t::EnsureOnlyDisplay);
+}
+
+/** @brief A client request requires the configured virtual display even when normal sessions leave displays unchanged. */
+TEST(PrivateDisplayTests, ClientRequestOverridesDevicePreparation) {
+  config::video_t video_config {};
+  video_config.dd.configuration_option = config_option_e::disabled;
+  rtsp_stream::launch_session_t request {};
+  request.privacy_screen = true;
+  EXPECT_TRUE(std::holds_alternative<display_device::configuration_disabled_tag_t>(display_device::parse_configuration(video_config, {})));
+  EXPECT_EQ(display_device::configure_display(video_config, request), display_device::configuration_result_e::privacy_unavailable);
+
+  video_config.output_name = "{virtual-device-id}";
+  const auto result = display_device::parse_configuration(video_config, request);
+  const auto *config = std::get_if<display_device::SingleDisplayConfiguration>(&result);
+  ASSERT_NE(config, nullptr);
+  EXPECT_EQ(config->m_device_id, video_config.output_name);
+  EXPECT_EQ(config->m_device_prep, device_prep_t::EnsureOnlyDisplay);
+  EXPECT_EQ(video_config.dd.configuration_option, config_option_e::disabled);
 }
 
 #ifdef _WIN32
@@ -122,18 +140,28 @@ TEST(PrivateDisplayTests, VerifiesTheExclusiveVirtualTarget) {
     }
   } api;
 
-  EXPECT_FALSE(has_privacy_target(api, QueryType::Active, {}));
+  const auto is_parsec = [](const DISPLAYCONFIG_PATH_INFO &path) {
+    return path.targetInfo.adapterId.LowPart == 1;
+  };
+  EXPECT_FALSE(has_privacy_target(api, QueryType::Active, {}, is_parsec));
   api.data.emplace();
-  EXPECT_FALSE(has_privacy_target(api, QueryType::Active, {}));
+  EXPECT_FALSE(has_privacy_target(api, QueryType::Active, {}, is_parsec));
   auto &path = api.data->m_paths.emplace_back();
-  path.targetInfo.outputTechnology = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI;
-  EXPECT_FALSE(has_privacy_target(api, QueryType::Active, {}));
+  path.targetInfo.outputTechnology = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EXTERNAL;
+  EXPECT_FALSE(has_privacy_target(api, QueryType::Active, "virtual-monitor", is_parsec));
+  path.targetInfo.adapterId.LowPart = 1;
+  EXPECT_TRUE(has_privacy_target(api, QueryType::Active, "virtual-monitor", is_parsec));
+  EXPECT_FALSE(has_privacy_target(api, QueryType::All, "unknown-monitor", is_parsec));
+  path.targetInfo.adapterId.LowPart = 0;
   path.targetInfo.outputTechnology = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_VIRTUAL;
-  EXPECT_TRUE(has_privacy_target(api, QueryType::Active, "virtual-monitor"));
-  EXPECT_FALSE(has_privacy_target(api, QueryType::All, "unknown-monitor"));
+  EXPECT_TRUE(has_privacy_target(api, QueryType::Active, "virtual-monitor", is_parsec));
   api.data->m_paths.emplace_back().targetInfo.outputTechnology = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI;
-  EXPECT_TRUE(has_privacy_target(api, QueryType::All, "virtual-monitor"));
-  EXPECT_FALSE(has_privacy_target(api, QueryType::Active, {}));
+  EXPECT_TRUE(has_privacy_target(api, QueryType::All, "virtual-monitor", is_parsec));
+  EXPECT_FALSE(has_privacy_target(api, QueryType::Active, {}, is_parsec));
+  api.data->m_paths.front().targetInfo.outputTechnology = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_DISPLAYPORT_EXTERNAL;
+  api.data->m_paths.front().targetInfo.adapterId.LowPart = 1;
+  EXPECT_TRUE(has_privacy_target(api, QueryType::All, "virtual-monitor", is_parsec));
+  EXPECT_FALSE(has_privacy_target(api, QueryType::Active, "virtual-monitor", is_parsec));
 }
 #endif
 
