@@ -475,6 +475,16 @@ TEST_F(InputGamepadSessionTest, BatchesContinuousPacketsWithoutCrossingStateChan
   expect_packet_dispatches(motion, changed_motion, SS_CONTROLLER_MOTION_MAGIC, 2);
 }
 
+TEST_F(InputGamepadSessionTest, CompanionUsesIndependentInputUntilClosed) {
+  const auto mail = std::make_shared<safe::mail_raw_t>();
+  auto primary = input::alloc(mail, "primary", false);
+  auto companion = input::alloc(std::make_shared<safe::mail_raw_t>(), "primary:2", false);
+  EXPECT_NE(primary, companion);
+  input::terminate_gamepads("primary:2");
+  EXPECT_EQ(primary, input::alloc(mail, "primary", false));
+  EXPECT_NE(companion, input::alloc(mail, "primary:2", false));
+}
+
 TEST_F(InputGamepadSessionTest, ReusesGamepadsAcrossPauseAndDestroysThemOnTermination) {
   const std::string session_id = "paired-client-certificate";
   auto first_mail = std::make_shared<safe::mail_raw_t>();

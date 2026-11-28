@@ -30,6 +30,9 @@ extern "C" {
 #include "input.h"
 #include "logging.h"
 #include "network.h"
+#ifdef _WIN32
+  #include "platform/windows/local_sessions.h"
+#endif
 #include "rtsp.h"
 #include "stream.h"
 #include "sync.h"
@@ -630,6 +633,20 @@ namespace rtsp_stream {
       });
     }
 
+    /** @brief Submit a bitrate change only for a stream owned by this paired certificate. */
+    std::future<bool> request_bitrate(std::string_view cert, std::string_view id, int kbps) {
+      auto lg = _session_slots.lock();
+      for (const auto &slot : *_session_slots) {
+        if (!cert.empty() && stream::session::client_cert(*slot) == cert) {
+          auto result = stream::session::request_bitrate(*slot, id, kbps);
+          if (result.valid()) {
+            return result;
+          }
+        }
+      }
+      return {};
+    }
+
     /** @brief Match the stream to its TLS certificate and launch ID before updating its lock policy. */
     std::optional<bool> update_disconnect_lock(std::string_view cert, std::string_view id, bool enabled) {
       auto lg = _session_slots.lock();
@@ -793,6 +810,10 @@ namespace rtsp_stream {
     return server.has_private_session();
   }
 
+  std::future<bool> request_bitrate(std::string_view cert, std::string_view id, int kbps) {
+    return server.request_bitrate(cert, id, kbps);
+  }
+
   std::optional<bool> update_disconnect_lock(std::string_view cert, std::string_view id, bool enabled) {
     return server.update_disconnect_lock(cert, id, enabled);
   }
@@ -802,6 +823,9 @@ namespace rtsp_stream {
   }
 
   void terminate_sessions() {
+#ifdef _WIN32
+    platf::local_sessions::current().revoke_recovery();
+#endif
     server.clear(true);
     input::terminate_gamepads();
   }
@@ -810,6 +834,11 @@ namespace rtsp_stream {
    * @brief Terminate active sessions associated with a client certificate.
    */
   void terminate_sessions_by_cert(std::string_view cert) {
+#ifdef _WIN32
+    if (!cert.empty()) {
+      platf::local_sessions::current().revoke_recovery(std::string {cert});
+    }
+#endif
     server.clear_by_cert(cert);
     input::terminate_gamepads(cert);
   }
@@ -1304,21 +1333,7 @@ namespace rtsp_stream {
     if (configuredBitrateKbps) {
       BOOST_LOG(debug) << "Client configured bitrate is "sv << configuredBitrateKbps << " Kbps"sv;
 
-      // If the FEC percentage isn't too high, adjust the configured bitrate to ensure video
-      // traffic doesn't exceed the user's selected bitrate when the FEC shards are included.
-      if (config::stream.fec_percentage <= 80) {
-        configuredBitrateKbps /= 100.f / (100 - config::stream.fec_percentage);
-      }
-
-      // Adjust the bitrate to account for audio traffic bandwidth usage (capped at 20% reduction).
-      // The bitrate per channel is 256 Kbps for high quality mode and 96 Kbps for normal quality.
-      auto audioBitrateAdjustment = (config.audio.flags[audio::config_t::HIGH_QUALITY] ? 256 : 96) * config.audio.channels;
-      configuredBitrateKbps -= std::min((std::int64_t) audioBitrateAdjustment, configuredBitrateKbps / 5);
-
-      // Reduce it by another 500Kbps to account for A/V packet overhead and control data
-      // traffic (capped at 10% reduction).
-      configuredBitrateKbps -= std::min((std::int64_t) 500, configuredBitrateKbps / 10);
-
+      configuredBitrateKbps = stream::video_bitrate(configuredBitrateKbps, config.audio);
       BOOST_LOG(debug) << "Final adjusted video encoding bitrate is "sv << configuredBitrateKbps << " Kbps"sv;
       config.monitor.bitrate = (int) configuredBitrateKbps;
     }
@@ -1409,6 +1424,9 @@ namespace rtsp_stream {
       return;
     }
 
+#ifdef _WIN32
+    std::jthread local_session_thread {platf::local_sessions::serve, std::ref(platf::local_sessions::current()), platf::local_sessions::pipe_name()};
+#endif
     std::jthread rtsp_thread {[&shutdown_event] {
       platf::set_thread_name("rtsp::handler");
       auto broadcast_shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);

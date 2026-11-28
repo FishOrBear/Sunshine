@@ -91,11 +91,13 @@ TEST_P(ParseDeviceId, IntegrationTest) {
   EXPECT_EQ(std::get<display_device::SingleDisplayConfiguration>(result).m_device_id, expected_value);
 }
 
-/** @brief A privacy stream must target an explicit virtual display and must never default to the primary monitor. */
+/** @brief Disabling provisioning requires an explicitly configured privacy target. */
 TEST(PrivateDisplayTests, RequiresAnExplicitOutput) {
   config::video_t video_config {};
   video_config.dd.configuration_option = config_option_e::privacy_screen;
-  EXPECT_EQ(display_device::configure_display(video_config, {}), display_device::configuration_result_e::privacy_unavailable);
+  rtsp_stream::launch_session_t request {};
+  request.create_privacy_display = false;
+  EXPECT_EQ(display_device::configure_display(video_config, request), display_device::configuration_result_e::privacy_unavailable);
   video_config.output_name = "{virtual-device-id}";
   const auto result = display_device::parse_configuration(video_config, {});
   const auto *config = std::get_if<display_device::SingleDisplayConfiguration>(&result);
@@ -104,12 +106,65 @@ TEST(PrivateDisplayTests, RequiresAnExplicitOutput) {
   EXPECT_EQ(config->m_device_prep, device_prep_t::EnsureOnlyDisplay);
 }
 
+/** @brief Verify the requested ID and every requested mode before allowing locked read-only access. */
+TEST(PrivateDisplayTests, RejectsAnUnverifiedLockedMode) {
+  display_device::EnumeratedDeviceList devices(1);
+  auto &device = devices.front();
+  device.m_device_id = "virtual";
+  display_device::SingleDisplayConfiguration desired;
+  desired.m_device_id = device.m_device_id;
+  EXPECT_FALSE(display_device::matches_privacy_mode(devices, desired));
+  auto &actual = device.m_info.emplace();
+  actual.m_resolution = {1920, 1080};
+  actual.m_refresh_rate = 60.0;
+  actual.m_hdr_state = hdr_state_e::Disabled;
+  desired.m_resolution = actual.m_resolution;
+  desired.m_refresh_rate = actual.m_refresh_rate;
+  desired.m_hdr_state = actual.m_hdr_state;
+  EXPECT_TRUE(display_device::matches_privacy_mode(devices, desired));
+  desired.m_resolution = resolution_t {1280, 720};
+  EXPECT_FALSE(display_device::matches_privacy_mode(devices, desired));
+  desired.m_resolution.reset();
+  desired.m_refresh_rate = 120.0;
+  EXPECT_FALSE(display_device::matches_privacy_mode(devices, desired));
+  desired.m_refresh_rate.reset();
+  desired.m_hdr_state = hdr_state_e::Enabled;
+  EXPECT_FALSE(display_device::matches_privacy_mode(devices, desired));
+  desired.m_hdr_state.reset();
+  EXPECT_TRUE(display_device::matches_privacy_mode(devices, desired));
+  desired.m_device_id = "another";
+  EXPECT_FALSE(display_device::matches_privacy_mode(devices, desired));
+}
+
+/** @brief Privacy streams can provision a monitor by default while public streams keep their configured preparation. */
+TEST(PrivateDisplayTests, DefaultProvisioningAndDesktopSize) {
+  config::video_t video {};
+  video.dd.configuration_option = config_option_e::verify_only;
+  rtsp_stream::launch_session_t request {};
+  request.privacy_screen = true;
+  request.privacy_desktop_size = "2560x1440";
+  EXPECT_TRUE(request.create_privacy_display);
+  const auto private_config = std::get<display_device::SingleDisplayConfiguration>(display_device::parse_configuration(video, request));
+  EXPECT_EQ(private_config.m_device_prep, device_prep_t::EnsureOnlyDisplay);
+  EXPECT_EQ(private_config.m_resolution, (resolution_t {2560, 1440}));
+  request.privacy_desktop_size = "9999x1080";
+  EXPECT_TRUE(std::holds_alternative<display_device::failed_to_parse_tag_t>(display_device::parse_configuration(video, request)));
+  request.privacy_screen = false;
+  const auto normal = std::get<display_device::SingleDisplayConfiguration>(display_device::parse_configuration(video, request));
+  EXPECT_FALSE(normal.m_resolution);
+  EXPECT_EQ(normal.m_device_prep, device_prep_t::VerifyOnly);
+  for (const auto *invalid : {"", "0x0", "1920x", "abx1080", "1234567890", "1920x199", "8193x8192"}) {
+    EXPECT_FALSE(display_device::parse_privacy_resolution(invalid));
+  }
+}
+
 /** @brief A client request requires the configured virtual display even when normal sessions leave displays unchanged. */
 TEST(PrivateDisplayTests, ClientRequestOverridesDevicePreparation) {
   config::video_t video_config {};
   video_config.dd.configuration_option = config_option_e::disabled;
   rtsp_stream::launch_session_t request {};
   request.privacy_screen = true;
+  request.create_privacy_display = false;
   EXPECT_TRUE(std::holds_alternative<display_device::configuration_disabled_tag_t>(display_device::parse_configuration(video_config, {})));
   EXPECT_EQ(display_device::configure_display(video_config, request), display_device::configuration_result_e::privacy_unavailable);
 
@@ -123,22 +178,38 @@ TEST(PrivateDisplayTests, ClientRequestOverridesDevicePreparation) {
 }
 
 #ifdef _WIN32
-/** @brief Require a monitored virtual target before launch and reject physical, cloned, or missing targets. */
-TEST(PrivateDisplayTests, VerifiesTheExclusiveVirtualTarget) {
+namespace {
   using namespace display_device;
 
-  class topology_t: public WinApiLayer {
+  /** @brief Whether the calling thread can perform a display operation that requires the input desktop. */
+  bool thread_on_input_desktop() {
+    BOOL active {};
+    return GetUserObjectInformationW(GetThreadDesktop(GetCurrentThreadId()), UOI_IO, &active, sizeof(active), nullptr) && active;
+  }
+
+  /** @brief Supply Windows display paths without touching the machine's monitors. */
+  class privacy_paths_t: public WinApiLayer {
   public:
     std::optional<PathAndModeData> data;  ///< Simulated query result.
+    bool input_desktop_required {};  ///< Model display APIs that deny calls from a background desktop.
 
     std::optional<PathAndModeData> queryDisplayConfig(QueryType) const override {
+      if (input_desktop_required && !thread_on_input_desktop()) {
+        return std::nullopt;
+      }
       return data;
     }
 
     std::string getDeviceId(const DISPLAYCONFIG_PATH_INFO &) const override {
       return "virtual-monitor";
     }
-  } api;
+  };
+}  // namespace
+
+/** @brief Require a monitored virtual target before launch and reject physical, cloned, or missing targets. */
+TEST(PrivateDisplayTests, VerifiesTheExclusiveVirtualTarget) {
+  using namespace display_device;
+  privacy_paths_t api;
 
   const auto is_parsec = [](const DISPLAYCONFIG_PATH_INFO &path) {
     return path.targetInfo.adapterId.LowPart == 1;
@@ -162,6 +233,135 @@ TEST(PrivateDisplayTests, VerifiesTheExclusiveVirtualTarget) {
   api.data->m_paths.front().targetInfo.adapterId.LowPart = 1;
   EXPECT_TRUE(has_privacy_target(api, QueryType::All, "virtual-monitor", is_parsec));
   EXPECT_FALSE(has_privacy_target(api, QueryType::Active, "virtual-monitor", is_parsec));
+}
+
+namespace {
+  /** @brief Model the configured virtual monitor and the physical output it replaces for a session. */
+  class privacy_settings_t: public SettingsManagerInterface {
+  public:
+    explicit privacy_settings_t(privacy_paths_t &paths):
+        paths {paths} {
+      device.m_device_id = "virtual-monitor";
+      device.m_info.emplace().m_resolution = {1920, 1080};
+    }
+
+    EnumeratedDeviceList enumAvailableDevices() const override {
+      return paths.input_desktop_required && !thread_on_input_desktop() ? EnumeratedDeviceList {} : EnumeratedDeviceList {device};
+    }
+
+    std::string getDisplayName(const std::string &) const override {
+      return paths.input_desktop_required && !thread_on_input_desktop() ? std::string {} : device.m_device_id;
+    }
+
+    ApplyResult applySettings(const SingleDisplayConfiguration &desired) override {
+      if (read_only || (paths.input_desktop_required && !thread_on_input_desktop())) {
+        return ApplyResult::ApiTemporarilyUnavailable;
+      }
+      EXPECT_EQ(desired.m_device_prep, device_prep_t::EnsureOnlyDisplay);
+      paths.data->m_paths.resize(1);
+      if (desired.m_resolution) {
+        device.m_info->m_resolution = *desired.m_resolution;
+      }
+      return ApplyResult::Ok;
+    }
+
+    RevertResult revertSettings() override {
+      if (paths.input_desktop_required && !thread_on_input_desktop()) {
+        return RevertResult::ApiTemporarilyUnavailable;
+      }
+      paths.data->m_paths.resize(2);
+      return RevertResult::Ok;
+    }
+
+    bool resetPersistence() override {
+      return true;
+    }
+
+    bool read_only {};  ///< Reject display writes while allowing the current mode to be verified.
+    privacy_paths_t &paths;  ///< Windows paths resulting from a simulated mode change.
+    EnumeratedDevice device;  ///< Current virtual desktop mode.
+  };
+
+  /** @brief Exercise the launch/resume display configuration and the RTSP privacy checks together. */
+  class LockedPrivacyDisplay: public BaseTest {
+  protected:
+    void SetUp() override {
+      BaseTest::SetUp();
+      auto manager = std::make_unique<privacy_settings_t>(*paths);
+      settings = manager.get();
+      paths->data.emplace().m_paths.resize(2);
+      paths->data->m_paths[0].targetInfo.outputTechnology = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_VIRTUAL;
+      paths->data->m_paths[1].targetInfo.outputTechnology = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI;
+      display_device::test_install_settings_manager(std::move(manager), display_device::test_make_watched_persistence());
+      display_device::test_set_display_api(paths);
+      video.output_name = "virtual-monitor";
+      request.privacy_screen = true;
+      request.create_privacy_display = false;
+      request.privacy_desktop_size = "1920x1080";
+    }
+
+    void TearDown() override {
+      display_device::test_reset_display_device();
+      BaseTest::TearDown();
+    }
+
+    std::shared_ptr<privacy_paths_t> paths {std::make_shared<privacy_paths_t>()};  ///< Simulated CCD queries.
+    privacy_settings_t *settings {};  ///< Borrowed from the settings scheduler.
+    config::video_t video {};  ///< Host display configuration.
+    rtsp_stream::launch_session_t request {};  ///< Private session with automatic provisioning disabled.
+  };
+}  // namespace
+
+/** @brief A read-only configured target must already have the requested mode and be exclusively active. */
+TEST_F(LockedPrivacyDisplay, VerifiesConfiguredMonitorWhenWindowsDeniesWrites) {
+  using enum display_device::configuration_result_e;
+  settings->read_only = true;
+  EXPECT_EQ(display_device::configure_display(video, request), privacy_api_unavailable);
+  EXPECT_FALSE(display_device::privacy_screen_active());
+
+  paths->data->m_paths.resize(1);
+  request.privacy_desktop_size = "1280x720";
+  EXPECT_EQ(display_device::configure_display(video, request), privacy_api_unavailable);
+  request.privacy_desktop_size = "1920x1080";
+  ASSERT_EQ(display_device::configure_display(video, request), ready);
+  EXPECT_TRUE(display_device::privacy_screen_active());
+  paths->data->m_paths.emplace_back();
+  EXPECT_FALSE(display_device::privacy_screen_active());
+  paths->data.reset();
+  EXPECT_FALSE(display_device::privacy_screen_active());
+}
+
+/** @brief Start, verify, resize, and restore from a thread pinned by a window to a non-input desktop. */
+TEST_F(LockedPrivacyDisplay, UsesInputDesktopWhileCallerStaysOnItsOwnDesktop) {
+  using desktop_t = util::safe_ptr_v2<std::remove_pointer_t<HDESK>, BOOL, &CloseDesktop>;
+  const desktop_t input {OpenInputDesktop(0, FALSE, GENERIC_READ | GENERIC_WRITE | DESKTOP_SWITCHDESKTOP)};
+  if (!input) {
+    GTEST_SKIP() << "The test process cannot open the interactive desktop";
+  }
+  const auto name = std::wstring(L"SunshinePrivacyTest-") + std::to_wstring(GetCurrentProcessId());
+  desktop_t background {CreateDesktopW(name.c_str(), nullptr, nullptr, 0, GENERIC_ALL, nullptr)};
+  ASSERT_TRUE(background);
+  paths->input_desktop_required = true;
+  std::thread caller([&] {
+    ASSERT_TRUE(SetThreadDesktop(background.get()));
+    ASSERT_FALSE(thread_on_input_desktop());
+    const auto window = CreateWindowExW(0, L"STATIC", L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, nullptr, nullptr);
+    ASSERT_NE(window, nullptr);
+    const auto close_window = util::fail_guard([&] {
+      DestroyWindow(window);
+    });
+
+    ASSERT_EQ(display_device::configure_display(video, request), display_device::configuration_result_e::ready);
+    EXPECT_TRUE(display_device::privacy_screen_active());
+    EXPECT_EQ(display_device::map_output_name(video.output_name), video.output_name);
+    EXPECT_EQ(display_device::enumerate_devices().size(), 1u);
+    EXPECT_TRUE(display_device::resize_privacy_display({1280, 720}));
+    display_device::revert_configuration();
+    EXPECT_EQ(paths->data->m_paths.size(), 2u);
+    EXPECT_FALSE(display_device::privacy_screen_active());
+    EXPECT_FALSE(thread_on_input_desktop());
+  });
+  caller.join();
 }
 #endif
 

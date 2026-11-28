@@ -455,6 +455,12 @@ brew uninstall sunshine
    | AMD64/x64 (Intel/AMD) | [Sunshine-Windows-AMD64-installer.msi](https://github.com/SunshineStream/Sunshine/releases/latest/download/Sunshine-Windows-AMD64-installer.msi) |
    | ARM64                 | [Sunshine-Windows-ARM64-installer.msi](https://github.com/SunshineStream/Sunshine/releases/latest/download/Sunshine-Windows-ARM64-installer.msi) |
 
+The x64 installer selects **Parsec Virtual Display Driver** by default so Sunshine can create a temporary display
+when a client requests a privacy screen. Setup reuses a working adapter. If it is missing on a supported host,
+setup downloads version 0.45.0.0 from Parsec, verifies its SHA-256 and publisher signature, and checks the installed
+device. Clear the component in the installer to skip it, or pass `-SkipPrivacyDriver` when running
+`scripts/sunshine-setup.ps1 -Action install` directly. See the [Parsec driver prerequisites](https://support.parsec.app/hc/en-us/articles/32381178803604).
+
 > [!TIP]
 > Installer logs can be found in the following directory:
 > `%%TEMP%/Sunshine/logs/install/`

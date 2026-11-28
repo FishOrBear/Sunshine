@@ -5,6 +5,8 @@
 // standard includes
 #include <array>
 #include <cmath>
+#include <mutex>
+#include <set>
 #include <thread>
 #include <utility>
 
@@ -58,11 +60,27 @@ namespace platf {
 namespace platf::dxgi {
   namespace bp = boost::process::v1;
 
+  static std::mutex duplication_mutex;  ///< Serializes short-lived output probes with capture acquisition and release.
+  static std::set<HMONITOR> captured_monitors;  ///< Attached outputs with a live Desktop Duplication session in this process.
+
   /**
    * DDAPI-specific initialization goes here.
    */
   int duplication_t::init(display_base_t *display, const ::video::config_t &config) {
+    DXGI_OUTPUT_DESC output_desc {};
+    if (FAILED(display->output->GetDesc(&output_desc))) {
+      return -1;
+    }
     HRESULT status;
+    auto open_duplication = [&](auto duplicate) {
+      std::lock_guard lock {duplication_mutex};
+      const auto result = duplicate();
+      if (SUCCEEDED(result)) {
+        captured_monitor = output_desc.Monitor;
+        captured_monitors.insert(captured_monitor);
+      }
+      return result;
+    };
 
     // Capture format will be determined from the first call to AcquireNextFrame()
     display->capture_format = DXGI_FORMAT_UNKNOWN;
@@ -85,7 +103,9 @@ namespace platf::dxgi {
           // Ensure we can duplicate the current display
           syncThreadDesktop();
 
-          status = output5->DuplicateOutput1((IUnknown *) display->device.get(), 0, supported_formats.size(), supported_formats.data(), &dup);
+          status = open_duplication([&] {
+            return output5->DuplicateOutput1((IUnknown *) display->device.get(), 0, supported_formats.size(), supported_formats.data(), &dup);
+          });
           if (SUCCEEDED(status)) {
             break;
           }
@@ -113,7 +133,9 @@ namespace platf::dxgi {
           // Ensure we can duplicate the current display
           syncThreadDesktop();
 
-          status = output1->DuplicateOutput((IUnknown *) display->device.get(), &dup);
+          status = open_duplication([&] {
+            return output1->DuplicateOutput((IUnknown *) display->device.get(), &dup);
+          });
           if (SUCCEEDED(status)) {
             break;
           }
@@ -182,7 +204,12 @@ namespace platf::dxgi {
   capture_e duplication_t::reset(dup_t::pointer dup_p) {
     auto capture_status = release_frame();
 
+    std::lock_guard lock {duplication_mutex};
     dup.reset(dup_p);
+    if (!dup && captured_monitor) {
+      captured_monitors.erase(captured_monitor);
+      captured_monitor = nullptr;
+    }
 
     return capture_status;
   }
@@ -219,7 +246,7 @@ namespace platf::dxgi {
   }
 
   duplication_t::~duplication_t() {
-    release_frame();
+    reset();
   }
 
   capture_e display_base_t::capture(const push_captured_image_cb_t &push_captured_image_cb, const pull_free_image_cb_t &pull_free_image_cb, bool *cursor) {
@@ -372,11 +399,18 @@ namespace platf::dxgi {
    * @details When testing for enumeration only, we avoid resyncing the thread desktop.
    * @param adapter The DXGI adapter to use for capture.
    * @param output The DXGI output to capture.
+   * @param monitor Monitor handle from the attached DXGI output descriptor.
    * @param enumeration_only Specifies whether this test is occurring for display enumeration.
    *
    * @return True when Desktop Duplication can capture the requested output.
    */
-  bool test_dxgi_duplication(adapter_t &adapter, output_t &output, bool enumeration_only) {
+  bool test_dxgi_duplication(adapter_t &adapter, output_t &output, HMONITOR monitor, bool enumeration_only) {
+    std::unique_lock lock {duplication_mutex};
+    // DXGI rejects a second duplicator for the same output in one process.
+    // Enumeration can use our existing session as proof of capturability.
+    if (enumeration_only && captured_monitors.contains(monitor)) {
+      return true;
+    }
     std::array<D3D_FEATURE_LEVEL, 7> featureLevels {
       D3D_FEATURE_LEVEL_11_1,
       D3D_FEATURE_LEVEL_11_0,
@@ -414,8 +448,6 @@ namespace platf::dxgi {
 
     // Check if we can use the Desktop Duplication API on this output
     for (int x = 0; x < 2; ++x) {
-      dup_t dup;
-
       // Only resynchronize the thread desktop when not enumerating displays.
       // During enumeration, the caller will do this only once to ensure
       // a consistent view of available outputs.
@@ -423,9 +455,12 @@ namespace platf::dxgi {
         syncThreadDesktop();
       }
 
-      status = output1->DuplicateOutput((IUnknown *) device.get(), &dup);
-      if (SUCCEEDED(status)) {
-        return true;
+      {
+        dup_t dup;
+        status = output1->DuplicateOutput((IUnknown *) device.get(), &dup);
+        if (SUCCEEDED(status)) {
+          return true;
+        }
       }
 
       // If we're not resyncing the thread desktop and we don't have permission to
@@ -433,7 +468,12 @@ namespace platf::dxgi {
       if (enumeration_only && status == E_ACCESSDENIED) {
         break;
       } else {
+        lock.unlock();
         std::this_thread::sleep_for(200ms);
+        lock.lock();
+        if (enumeration_only && captured_monitors.contains(monitor)) {
+          return true;
+        }
       }
     }
 
@@ -524,7 +564,7 @@ namespace platf::dxgi {
             continue;
           }
 
-          if (desc.AttachedToDesktop && test_dxgi_duplication(adapter_tmp, output_tmp, false)) {
+          if (desc.AttachedToDesktop && test_dxgi_duplication(adapter_tmp, output_tmp, desc.Monitor, false)) {
             output = std::move(output_tmp);
 
             offset_x = desc.DesktopCoordinates.left;
@@ -1121,7 +1161,7 @@ namespace platf {
           << std::endl;
 
         // Don't include the display in the list if we can't actually capture it
-        if (desc.AttachedToDesktop && dxgi::test_dxgi_duplication(adapter, output, true)) {
+        if (desc.AttachedToDesktop && dxgi::test_dxgi_duplication(adapter, output, desc.Monitor, true)) {
           display_names.emplace_back(std::move(device_name));
         }
       }
@@ -1151,8 +1191,7 @@ namespace platf {
         factory.release();
       }
 
-      // Always request reenumeration on the first streaming session just to ensure we
-      // can deal with any initialization races that may occur when the system is booting.
+      // The new factory tracks changes from the beginning of this probe.
       BOOST_LOG(info) << "Encoder reenumeration is required"sv;
       return true;
     } else {

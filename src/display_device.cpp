@@ -32,9 +32,12 @@
 
 // platform-specific includes
 #ifdef _WIN32
+  #include "platform/windows/parsec_display.h"
+
   #include <display_device/windows/settings_manager.h>
   #include <display_device/windows/win_api_layer.h>
   #include <display_device/windows/win_display_device.h>
+  #include <future>
   #include <setupapi.h>
 #endif
 
@@ -47,6 +50,46 @@
 
 namespace display_device {
   namespace {
+#ifdef _WIN32
+    // Accessed only inside the serial settings scheduler.
+    std::unique_ptr<platf::parsec_display_t> temporary_display;
+    std::optional<SingleDisplayConfiguration> private_configuration;
+    std::shared_ptr<WinApiLayerInterface> display_api {std::make_shared<WinApiLayer>()};  ///< CCD access shared by configuration and independent verification.
+#endif
+
+    /**
+     * @brief Run a scheduled display operation on the desktop currently receiving input.
+     * @param work Operation taking the settings manager and its stop token.
+     * @return A synchronous callback for the settings scheduler.
+     */
+    template<class Work>
+    auto on_display_desktop(Work work) {
+#ifdef _WIN32
+      return [work = std::move(work)](SettingsManagerInterface &settings, SchedulerStopToken &stop) mutable {
+        BOOL receives_input {};
+        if (!GetUserObjectInformationW(GetThreadDesktop(GetCurrentThreadId()), UOI_IO, &receives_input, sizeof(receives_input), nullptr) || !receives_input) {
+          using desktop_t = util::safe_ptr_v2<std::remove_pointer_t<HDESK>, BOOL, &CloseDesktop>;
+          desktop_t desktop {OpenInputDesktop(0, FALSE, GENERIC_READ | GENERIC_WRITE | DESKTOP_SWITCHDESKTOP)};
+          if (desktop) {
+            // An HTTP or capture thread may own windows and cannot change desktops. Keep the
+            // handle open until the worker exits, leaving the caller on its original desktop.
+            return std::async(std::launch::async, [&] {
+                     if (!SetThreadDesktop(desktop.get())) {
+                       BOOST_LOG(debug) << "Could not attach display settings worker to input desktop: " << GetLastError();
+                     }
+                     return work(settings, stop);
+                   })
+              .get();
+          }
+        }
+        // Windows may still permit read-only queries with the caller's existing desktop access.
+        return work(settings, stop);
+      };
+#else
+      return work;
+#endif
+    }
+
     constexpr std::chrono::milliseconds DEFAULT_RETRY_INTERVAL {5000};
 
     /**
@@ -745,7 +788,7 @@ namespace display_device {
       DD_DATA.persistence_watch.reset();
 #ifdef _WIN32
       return std::make_unique<SettingsManager>(
-        std::make_shared<WinDisplayDevice>(std::make_shared<WinApiLayer>(), false),
+        std::make_shared<WinDisplayDevice>(display_api, false),
         std::make_shared<sunshine_audio_context_t>(),
         std::make_unique<PersistentState>(make_persistence_watch(persistence_filepath)),
         WinWorkarounds {
@@ -790,8 +833,14 @@ namespace display_device {
      * @param stop_token Token used to stop the scheduler once the revert is complete.
      */
     void try_revert_settings(const bool try_once, StringSet &tried_out_devices, const std::shared_ptr<watched_settings_persistence_t> &persistence_watch, SettingsManagerInterface &settings_iface, SchedulerStopToken &stop_token) {
+#ifdef _WIN32
+      private_configuration.reset();
+#endif
       if (try_once) {
         std::ignore = settings_iface.revertSettings();
+#ifdef _WIN32
+        temporary_display.reset();
+#endif
         stop_token.requestStop();
         return;
       }
@@ -822,6 +871,9 @@ namespace display_device {
       // A saved record after success means an unplugged display still has HDR, mode, or primary settings to restore.
       const bool restores_pending {persistence_watch && persistence_watch->has_pending_restores()};
       if (result == Ok && !restores_pending) {
+#ifdef _WIN32
+        temporary_display.reset();
+#endif
         stop_token.requestStop();
         return;
       }
@@ -864,9 +916,9 @@ namespace display_device {
       }
 
       const auto persistence_watch {DD_DATA.persistence_watch};
-      DD_DATA.sm_instance->schedule([try_once = (option == revert_option_e::try_once), tried_out_devices = StringSet {}, persistence_watch](auto &settings_iface, auto &stop_token) mutable {
-        try_revert_settings(try_once, tried_out_devices, persistence_watch, settings_iface, stop_token);
-      },
+      DD_DATA.sm_instance->schedule(on_display_desktop([try_once = (option == revert_option_e::try_once), tried_out_devices = StringSet {}, persistence_watch](auto &settings_iface, auto &stop_token) mutable {
+                                      try_revert_settings(try_once, tried_out_devices, persistence_watch, settings_iface, stop_token);
+                                    }),
                                     scheduler_option);
     }
   }  // namespace
@@ -940,9 +992,9 @@ namespace display_device {
       return output_name;
     }
 
-    const auto mapped_name {DD_DATA.sm_instance->execute([&output_name](auto &settings_iface) {
+    const auto mapped_name {DD_DATA.sm_instance->execute(on_display_desktop([&output_name](auto &settings_iface, auto &) {
       return settings_iface.getDisplayName(output_name);
-    })};
+    }))};
 
 #ifdef __APPLE__
     if (mapped_name.empty() && is_unsigned_integer(output_name)) {
@@ -1018,9 +1070,85 @@ namespace display_device {
   }
 #endif
 
+  /** @brief Check every requested desktop setting when Windows allows reading but rejects writes. */
+  bool matches_privacy_mode(const EnumeratedDeviceList &devices, const SingleDisplayConfiguration &desired) {
+    const auto device = std::ranges::find(devices, desired.m_device_id, &EnumeratedDevice::m_device_id);
+    if (device == devices.end() || !device->m_info) {
+      return false;
+    }
+    const auto &mode = *device->m_info;
+    return (!desired.m_resolution || mode.m_resolution == *desired.m_resolution) &&
+           (!desired.m_hdr_state || mode.m_hdr_state == desired.m_hdr_state) &&
+           (!desired.m_refresh_rate || detail::fuzzyCompare(mode.m_refresh_rate, *desired.m_refresh_rate));
+  }
+
+#ifdef _WIN32
+  /** @brief Provision a monitor and wait for the configured target or a newly arrived Parsec output. */
+  static std::string create_privacy_target(const WinApiLayerInterface &api, SettingsManagerInterface &settings, const std::string &requested) {
+    const auto before = settings.enumAvailableDevices();
+    if (!temporary_display) {
+      temporary_display = platf::parsec_display_t::create();
+    }
+    if (!temporary_display) {
+      return {};
+    }
+    for (int attempt = 0; attempt < 30; ++attempt) {
+      if (!requested.empty() && has_privacy_target(api, QueryType::All, requested)) {
+        return requested;
+      }
+      if (requested.empty()) {
+        for (const auto &device : settings.enumAvailableDevices()) {
+          const auto existing = std::ranges::find(before, device.m_device_id, &EnumeratedDevice::m_device_id);
+          if (existing == before.end() && device.m_friendly_name == "ParsecVDA" && has_privacy_target(api, QueryType::All, device.m_device_id)) {
+            return device.m_device_id;
+          }
+        }
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    return {};
+  }
+#endif
+
   bool privacy_screen_active() {
 #ifdef _WIN32
-    return !config::video.output_name.empty() && has_privacy_target(WinApiLayer {}, QueryType::Active, config::video.output_name);
+    std::lock_guard lock {DD_DATA.mutex};
+    return DD_DATA.sm_instance && DD_DATA.sm_instance->execute(on_display_desktop([](auto &, auto &) {
+      return private_configuration && has_privacy_target(*display_api, QueryType::Active, private_configuration->m_device_id);
+    }));
+#else
+    return false;
+#endif
+  }
+
+  std::optional<Resolution> parse_privacy_resolution(const std::string &size) {
+    std::optional<Resolution> parsed;
+    if (size.size() > 9 || !parse_resolution_string(size, parsed) || !parsed || parsed->m_width < 320 || parsed->m_width > 8192 || parsed->m_height < 200 || parsed->m_height > 8192) {
+      return {};
+    }
+    return parsed;
+  }
+
+  bool resize_privacy_display(const Resolution &resolution) {
+#ifdef _WIN32
+    std::lock_guard lock {DD_DATA.mutex};
+    return DD_DATA.sm_instance && DD_DATA.sm_instance->execute(on_display_desktop([&](auto &settings, auto &) {
+      if (!private_configuration || !has_privacy_target(*display_api, QueryType::Active, private_configuration->m_device_id)) {
+        return false;
+      }
+      auto desired = *private_configuration;
+      desired.m_resolution = resolution;
+      if (settings.applySettings(desired) != SettingsManagerInterface::ApplyResult::Ok || !has_privacy_target(*display_api, QueryType::Active, desired.m_device_id)) {
+        return false;
+      }
+      const auto devices = settings.enumAvailableDevices();
+      const auto target = std::ranges::find(devices, desired.m_device_id, &EnumeratedDevice::m_device_id);
+      if (target == devices.end() || !target->m_info || target->m_info->m_resolution != resolution) {
+        return false;
+      }
+      private_configuration = std::move(desired);
+      return true;
+    }));
 #else
     return false;
 #endif
@@ -1034,23 +1162,63 @@ namespace display_device {
       if (privacy) {
 #ifdef _WIN32
         std::lock_guard lock {DD_DATA.mutex};
-        const WinApiLayer api;
-        if (!DD_DATA.sm_instance || !has_privacy_target(api, QueryType::All, parsed_config->m_device_id)) {
+        if (!DD_DATA.sm_instance) {
           return privacy_unavailable;
         }
-        return DD_DATA.sm_instance->execute([&](auto &settings_iface, auto &stop_token) {
+        return DD_DATA.sm_instance->execute(on_display_desktop([&](auto &settings_iface, auto &stop_token) {
           // Cancel any previous restore and apply synchronously before an app or stream can start.
           stop_token.requestStop();
-          const auto applied = settings_iface.applySettings(*parsed_config);
-          if (applied == SettingsManagerInterface::ApplyResult::ApiTemporarilyUnavailable) {
-            return privacy_api_unavailable;
+          auto desired = *parsed_config;
+          const auto &api = *display_api;
+          if (session.create_privacy_display) {
+            if (desired.m_device_id.empty() && temporary_display) {
+              desired.m_device_id = temporary_display->device_id;
+            }
+            if (desired.m_device_id.empty() || !has_privacy_target(api, QueryType::All, desired.m_device_id)) {
+              desired.m_device_id = create_privacy_target(api, settings_iface, desired.m_device_id);
+              if (temporary_display) {
+                temporary_display->device_id = desired.m_device_id;
+              }
+            }
           }
-          return applied == SettingsManagerInterface::ApplyResult::Ok && has_privacy_target(api, QueryType::Active, parsed_config->m_device_id) ? ready : privacy_unavailable;
-        });
+          if (desired.m_device_id.empty() || !has_privacy_target(api, QueryType::All, desired.m_device_id)) {
+            temporary_display.reset();
+            return privacy_unavailable;
+          }
+          const auto applied = settings_iface.applySettings(desired);
+          const bool exclusive = has_privacy_target(api, QueryType::Active, desired.m_device_id);
+          if (applied == SettingsManagerInterface::ApplyResult::ApiTemporarilyUnavailable) {
+            // A configured or newly provisioned monitor may already have the requested mode.
+            if (!exclusive || !matches_privacy_mode(settings_iface.enumAvailableDevices(), desired)) {
+              if (!DD_DATA.persistence_watch || !DD_DATA.persistence_watch->has_pending_restores()) {
+                temporary_display.reset();
+              }
+              return privacy_api_unavailable;
+            }
+          } else if (applied != SettingsManagerInterface::ApplyResult::Ok || !exclusive) {
+            return privacy_unavailable;
+          }
+          private_configuration = std::move(desired);
+          return ready;
+        }));
 #else
         return privacy_unavailable;
 #endif
       }
+#ifdef _WIN32
+      {
+        std::lock_guard lock {DD_DATA.mutex};
+        if (DD_DATA.sm_instance) {
+          const bool restore = DD_DATA.sm_instance->execute([](auto &) {
+            return private_configuration.has_value() || temporary_display != nullptr;
+          });
+          if (restore) {
+            // A public launch can arrive before the delayed restore from a private session.
+            revert_configuration_unlocked(revert_option_e::try_once);
+          }
+        }
+      }
+#endif
       configure_display(*parsed_config);
       return ready;
     }
@@ -1125,14 +1293,14 @@ namespace display_device {
       return {};
     }
 
-    return DD_DATA.sm_instance->execute([](auto &settings_iface) {
+    return DD_DATA.sm_instance->execute(on_display_desktop([](auto &settings_iface, auto &) {
       return settings_iface.enumAvailableDevices();
-    });
+    }));
   }
 
   std::variant<failed_to_parse_tag_t, configuration_disabled_tag_t, SingleDisplayConfiguration> parse_configuration(const config::video_t &video_config, const rtsp_stream::launch_session_t &session) {
     const bool privacy = session.privacy_screen || video_config.dd.configuration_option == config::video_t::dd_t::config_option_e::privacy_screen;
-    if (privacy && video_config.output_name.empty()) {
+    if (privacy && video_config.output_name.empty() && !session.create_privacy_display) {
       BOOST_LOG(error) << "Privacy screen requires the device ID of an installed virtual display in output_name.";
       return failed_to_parse_tag_t {};
     }
@@ -1175,6 +1343,12 @@ namespace display_device {
       return failed_to_parse_tag_t {};
     }
 
+    if (privacy && !session.privacy_desktop_size.empty()) {
+      config.m_resolution = parse_privacy_resolution(session.privacy_desktop_size);
+      if (!config.m_resolution) {
+        return failed_to_parse_tag_t {};
+      }
+    }
     return config;
   }
 
@@ -1233,6 +1407,13 @@ namespace display_device {
     DD_DATA.test_retry_interval = interval;
   }
 
+  #ifdef _WIN32
+  void test_set_display_api(std::shared_ptr<WinApiLayerInterface> api) {
+    std::lock_guard lock {DD_DATA.mutex};
+    display_api = std::move(api);
+  }
+  #endif
+
   bool test_revert_retry_is_scheduled() {
     std::lock_guard lock {DD_DATA.mutex};
     return DD_DATA.sm_instance && DD_DATA.sm_instance->isScheduled();
@@ -1246,6 +1427,11 @@ namespace display_device {
     DD_DATA.sm_instance.reset();
     DD_DATA.persistence_watch.reset();
     DD_DATA.test_retry_interval.reset();
+  #ifdef _WIN32
+    private_configuration.reset();
+    temporary_display.reset();
+    display_api = std::make_shared<WinApiLayer>();
+  #endif
   }
 #endif
 }  // namespace display_device

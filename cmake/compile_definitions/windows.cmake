@@ -70,6 +70,7 @@ set(PLATFORM_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/platform/windows/clipboard_paste_target.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/file_browser.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/host_power.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/local_sessions.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/misc.h"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/misc.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/input.cpp"

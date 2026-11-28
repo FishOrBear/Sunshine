@@ -4,6 +4,9 @@
  */
 #pragma once
 
+#include <string>
+#include <variant>
+
 // local includes
 #include "entry_handler.h"
 #include "thread_pool.h"
@@ -51,6 +54,7 @@ namespace mail {
   MAIL(broadcast_shutdown);  ///< Broadcast shutdown.
   MAIL(video_packets);  ///< Video packets.
   MAIL(audio_packets);  ///< Audio packets.
+  using display_selection_t = std::variant<int, std::string>;  ///< Shortcut index or capture output name.
   MAIL(switch_display);  ///< Switch display.
 
   // Local mail

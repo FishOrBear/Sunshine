@@ -361,7 +361,7 @@ namespace platf {
 #ifdef SUNSHINE_TESTS
       locked = locked || session.simulate_lock;
 #endif
-      if (operation == "drag-source" || operation == "drop-target" || operation == "delete" || operation == "rmdir") {
+      if (operation == "drag-source" || operation == "drop-target") {
         return 403;
       }
       if (!locked && !(pinned_read || open_read || resumable_upload)) {

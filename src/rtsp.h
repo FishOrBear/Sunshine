@@ -4,6 +4,8 @@
  */
 #pragma once
 
+#include <future>
+
 // standard includes
 #include <array>
 #include <atomic>
@@ -85,7 +87,11 @@ namespace rtsp_stream {
     uint32_t control_connect_data;  ///< Client-provided token used when connecting the control channel.
 
     bool host_audio;  ///< Whether host audio should be played locally.
+    bool view_only {};  ///< Ignore remote input when a client requests a viewing session.
     bool lock_on_disconnect {};  ///< Request to lock Windows when the last overlapping session disconnects.
+    std::string capture_output;  ///< Independent output requested by a companion window.
+    std::string privacy_desktop_size;  ///< Optional desktop resolution independent of encoded size.
+    bool create_privacy_display {true};  ///< Provision a missing virtual output for privacy streams unless explicitly disabled.
     bool privacy_screen {};  ///< Require an exclusive virtual display for this stream.
     std::string unique_id;  ///< Moonlight client unique identifier for this launch request.
     int width;  ///< Frame or display width in pixels.
@@ -104,6 +110,7 @@ namespace rtsp_stream {
     std::string rtsp_url_scheme;  ///< URL scheme selected by the RTSP SETUP flow.
     uint32_t rtsp_iv_counter;  ///< Counter value mixed into encrypted RTSP IVs.
     std::string client_cert;  ///< PEM certificate for the paired Moonlight client.
+    std::string recovery_token;  ///< Paired device epoch at HTTPS admission, checked again when registering the stream.
   };
 
   /**
@@ -140,6 +147,9 @@ namespace rtsp_stream {
 
   /** @brief Update the disconnect policy only for the specified stream of this paired client. */
   std::optional<bool> update_disconnect_lock(std::string_view cert, std::string_view id, bool enabled);
+
+  /** @brief Submit a rate change for an authenticated stream and receive its encoder acknowledgement. */
+  std::future<bool> request_bitrate(std::string_view cert, std::string_view id, int kbps);
 
   /** @brief Check whether an active stream requires exclusive virtual display topology. */
   bool has_private_session();

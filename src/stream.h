@@ -5,6 +5,7 @@
 #pragma once
 
 // standard includes
+#include <future>
 #include <optional>
 #include <utility>
 
@@ -47,7 +48,23 @@ namespace stream {
     std::optional<int> gcmap;  ///< Optional game-controller mapping override from the launch request.
   };
 
+  /** @brief Convert a stream bandwidth budget in kbps to the encoder target after FEC, audio and transport overhead. */
+  int video_bitrate(std::int64_t budget, const audio::config_t &audio);
+
   namespace session {
+    /** @brief One expiring bitrate change acknowledged by the video worker. */
+    struct bitrate_request_t {
+      int bitrate;  ///< Encoder target in kbps after overhead and host limits.
+      std::promise<bool> result;  ///< Completed once the encoder accepts or rejects the change.
+      std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);  ///< Latest time to apply.
+    };
+
+    /** @brief Submit a change to the matching active session. */
+    std::future<bool> request_bitrate(session_t &session, std::string_view id, int kbps);
+
+    /** @brief Consume the latest pending change on the encoder thread. */
+    std::shared_ptr<bitrate_request_t> take_bitrate_request(session_t &session);
+
     /**
      * @brief Track overlapping streams and defer desktop locking until the host is idle.
      */

@@ -314,10 +314,17 @@ TEST(StandaloneFileTransferTest, StartsUploadsAndDownloadsInANewLockedFileSessio
   ASSERT_EQ(op("folder-path", t.directory / "folder", {}), 200);
   const auto source = t.directory / "source";
   ASSERT_TRUE(std::ofstream(source) << "abc");
+  // Moonlight copies between two remote directories using by-path reads and writes.
+  ASSERT_EQ(op("read", source, {}), 200);
+  const auto block = t.output;
+  const auto copy = t.directory / "folder" / "copy";
+  ASSERT_EQ(op("write", copy, platf::new_file_lease(), {}, block), 204);
+  ASSERT_EQ(op("read", copy, {}), 200);
+  EXPECT_EQ(t.output, "abc");
   const auto read_id = platf::new_file_lease();
   ASSERT_EQ(op("open-read", source, read_id), 200);
   ASSERT_EQ(op("prepare-upload", t.destination, t.task), 204);
-  for (auto action : {"drag-source", "drop-target", "delete", "rmdir"}) {
+  for (auto action : {"drag-source", "drop-target"}) {
     EXPECT_EQ(op(action, source, read_id), 403) << action;
   }
   const auto other_id = platf::new_file_lease();
@@ -340,6 +347,46 @@ TEST(StandaloneFileTransferTest, StartsUploadsAndDownloadsInANewLockedFileSessio
   std::string content;
   std::ifstream(t.destination) >> content;
   EXPECT_EQ(content, "abc");
+}
+
+TEST(StandaloneFileTransferTest, DeletesListedItemsWhileLockedOnlyWithDeletionGrant) {
+  transfer_test_t t;
+  auto session = platf::make_file_browser_session();
+  const auto request = [&](std::string_view action, const fs::path &path, std::uint64_t size, std::optional<std::int64_t> modified, bool allow_delete) {
+    return platf::exchange_files(*session, action, win_clipboard::detail::to_utf8(path.generic_wstring()), {}, 0, size, modified, {}, t.output, [&] {
+      return t.active;
+    },
+                                 t.cert,
+                                 {},
+                                 nullptr,
+                                 allow_delete);
+  };
+  if (request("list", t.directory, 0, {}, false) == 403) {
+    GTEST_SKIP() << "A signed-in Windows shell is required to test file access";
+  }
+  ASSERT_TRUE(std::ofstream(t.destination) << "file");
+  const auto folder = t.directory / "folder";
+  ASSERT_TRUE(fs::create_directory(folder));
+  ASSERT_TRUE(std::ofstream(folder / "child") << "child");
+
+  platf::test_support::lock_file_session(*session);
+  ASSERT_EQ(request("list", t.directory, 0, {}, false), 200);
+  const auto entries = nlohmann::json::parse(t.output).at("entries");
+  ASSERT_EQ(entries.size(), 2);
+  for (const auto &entry : entries) {
+    const auto path = t.directory / entry.at("name").get<std::string>();
+    const auto size = std::stoull(entry.at("size").get<std::string>());
+    const auto modified = std::stoll(entry.at("modified").get<std::string>());
+    const auto action = entry.at("directory").get<bool>() ? "rmdir" : "delete";
+    EXPECT_EQ(request(action, path, size, modified, false), 403);
+    t.active = false;
+    EXPECT_EQ(request(action, path, size, modified, true), 403);
+    t.active = true;
+    EXPECT_EQ(request(action, path, size, modified + 1, true), 409);
+    ASSERT_TRUE(fs::exists(path));
+    EXPECT_EQ(request(action, path, size, modified, true), 204);
+    EXPECT_FALSE(fs::exists(path));
+  }
 }
 
 TEST(StandaloneFileTransferTest, ReadsPastFourGiBWithoutTruncatingOffsets) {

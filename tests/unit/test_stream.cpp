@@ -20,6 +20,7 @@
 #include <rs.h>
 
 // local includes
+#include <src/config.h>
 #include <src/network.h>
 #include <src/stream.h>
 
@@ -38,6 +39,21 @@ namespace stream {
     int max_data_shards(int percentage);
   }  // namespace fec
 }  // namespace stream
+
+/** @brief Live changes and startup reserve the same FEC, audio and control budget. */
+TEST(LiveBitrateTest, PreservesNegotiatedBandwidthAccounting) {
+  const auto saved = config::stream.fec_percentage;
+  auto restore = util::fail_guard([&] {
+    config::stream.fec_percentage = saved;
+  });
+  audio::config_t audio {};
+  audio.channels = 2;
+  config::stream.fec_percentage = 20;
+  EXPECT_EQ(stream::video_bitrate(8000, audio), 5708);
+  EXPECT_EQ(stream::video_bitrate(500, audio), 288);
+  audio.flags[audio::config_t::HIGH_QUALITY] = true;
+  EXPECT_EQ(stream::video_bitrate(8000, audio), 5388);
+}
 
 /** @brief A lock request survives its client and expires when the final overlapping stream finishes. */
 TEST(StreamActivityTests, LocksOnlyAfterTheLastOverlappingClient) {

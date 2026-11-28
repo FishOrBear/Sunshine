@@ -31,6 +31,7 @@
 #include "platform/common.h"
 #ifdef _WIN32
   #include "platform/windows/clipboard.h"
+  #include "platform/windows/local_sessions.h"
 #endif
 #include "process.h"
 #include "stream.h"
@@ -502,8 +503,11 @@ namespace stream {
    * @brief Runtime state for one audio/video streaming session.
    */
   struct session_t {
+    std::atomic<std::shared_ptr<session::bitrate_request_t>> pending_bitrate;  ///< Latest change awaiting the encoder thread.
     bool lock_on_disconnect {};  ///< Lock requested by this session or by the host.
+    std::string capture_output;  ///< Output pinned to this session independently of the shared capture.
     bool privacy_screen {};  ///< Whether this session required a private display.
+    bool view_only {};  ///< Suppress input on a stream opened for viewing.
     config_t config;  ///< Stream or encoder configuration captured for the worker.
 
     safe::mail_t mail;  ///< Mailbox used to distribute packets and lifecycle events.
@@ -567,6 +571,10 @@ namespace stream {
     } control;  ///< Runtime state for the encrypted GameStream control channel.
 
     std::uint32_t launch_session_id;  ///< RTSP launch-session ID associated with this stream.
+#ifdef _WIN32
+    std::string client_name;  ///< Name shown to the local user while this client is connected.
+    std::string recovery_token;  ///< Recovery epoch carried from HTTPS to RTSP registration.
+#endif
     clipboard::grant_t clipboard_grant;  ///< Session-scoped clipboard capability.
     std::string client_cert;  ///< PEM certificate for the paired client owning the stream.
     std::string input_session_id;  ///< Stable client identity used to retain input devices across resume.
@@ -1246,6 +1254,9 @@ namespace stream {
 
     server->map(packetTypes[IDX_INPUT_DATA], [&](session_t *session, const std::string_view &payload) {
       BOOST_LOG(debug) << "type [IDX_INPUT_DATA]"sv;
+      if (session->view_only) {
+        return;
+      }
 
       auto tagged_cipher_length = util::endian::big(*(int32_t *) payload.data());
       std::string_view tagged_cipher {payload.data() + sizeof(tagged_cipher_length), (size_t) tagged_cipher_length};
@@ -1329,6 +1340,9 @@ namespace stream {
 
       // IDX_INPUT_DATA callback will attempt to decrypt unencrypted data, therefore we need pass it directly
       if (type == packetTypes[IDX_INPUT_DATA]) {
+        if (session->view_only) {
+          return;
+        }
         plaintext.erase(std::begin(plaintext), std::begin(plaintext) + 4);
         input::passthrough(session->input, std::move(plaintext));
       } else {
@@ -2234,7 +2248,7 @@ namespace stream {
     session->video.qos = platf::enable_socket_qos(ref->video_sock.native_handle(), address, session->video.peer.port(), platf::qos_data_type_e::video, config::stream.dscp_tagging && session->config.videoQosType != 0);
 
     BOOST_LOG(debug) << "Start capturing Video"sv;
-    video::capture(session->mail, session->config.monitor, session);
+    video::capture(session->mail, session->config.monitor, session, session->capture_output);
   }
 
   /**
@@ -2264,7 +2278,46 @@ namespace stream {
     audio::capture(session->mail, session->config.audio, session);
   }
 
+  int video_bitrate(std::int64_t budget, const audio::config_t &audio) {
+    // If the FEC percentage isn't too high, adjust the configured bitrate to ensure video
+    // traffic doesn't exceed the user's selected bitrate when the FEC shards are included.
+    if (config::stream.fec_percentage <= 80) {
+      budget /= 100.f / (100 - config::stream.fec_percentage);
+    }
+
+    // Adjust the bitrate to account for audio traffic bandwidth usage (capped at 20% reduction).
+    // The bitrate per channel is 256 Kbps for high quality mode and 96 Kbps for normal quality.
+    auto audioBitrateAdjustment = (audio.flags[audio::config_t::HIGH_QUALITY] ? 256 : 96) * audio.channels;
+    budget -= std::min((std::int64_t) audioBitrateAdjustment, budget / 5);
+
+    // Reduce it by another 500Kbps to account for A/V packet overhead and control data
+    // traffic (capped at 10% reduction).
+    budget -= std::min((std::int64_t) 500, budget / 10);
+
+    return static_cast<int>(budget);
+  }
+
   namespace session {
+    std::future<bool> request_bitrate(session_t &session, std::string_view id, int kbps) {
+      if (id != std::to_string(session.launch_session_id) || state(session) != state_e::RUNNING) {
+        return {};
+      }
+      auto request = std::make_shared<bitrate_request_t>();
+      request->bitrate = video_bitrate(kbps, session.config.audio);
+      if (config::video.max_bitrate > 0) {
+        request->bitrate = std::min(request->bitrate, config::video.max_bitrate);
+      }
+      auto result = request->result.get_future();
+      if (auto superseded = session.pending_bitrate.exchange(request)) {
+        superseded->result.set_value(false);
+      }
+      return result;
+    }
+
+    std::shared_ptr<bitrate_request_t> take_bitrate_request(session_t &session) {
+      return session.pending_bitrate.load() ? session.pending_bitrate.exchange(nullptr) : nullptr;
+    }
+
     std::mutex lifecycle_mutex;  ///< Serializes the first-session and last-session callbacks.
     activity_t activity;  ///< First and last stream transitions protected by lifecycle_mutex.
 
@@ -2343,9 +2396,15 @@ namespace stream {
       // Reset input on session stop to avoid stuck repeated keys
       BOOST_LOG(debug) << "Resetting Input..."sv;
       input::reset(session.input);
+      if (!session.capture_output.empty()) {
+        input::terminate_gamepads(session.input_session_id);
+      }
 
       // If this is the last session, invoke the platform callbacks
       std::lock_guard lock {lifecycle_mutex};
+#ifdef _WIN32
+      platf::local_sessions::current().remove(session.launch_session_id);
+#endif
       if (const auto lock_requested = activity.finish(session.lock_on_disconnect); lock_requested.has_value()) {
 #ifdef _WIN32
         if (*lock_requested) {
@@ -2377,7 +2436,7 @@ namespace stream {
      * @brief Start the audio, video, and control workers for a streaming session.
      */
     int start(session_t &session, const std::string &addr_string) {
-      session.input = input::alloc(session.mail, session.input_session_id);
+      session.input = input::alloc(session.mail, session.input_session_id, session.capture_output.empty());
 
       session.broadcast_ref = broadcast.ref();
       if (!session.broadcast_ref) {
@@ -2412,6 +2471,13 @@ namespace stream {
       }
 #endif
       session.state.store(state_e::RUNNING, std::memory_order_release);
+#ifdef _WIN32
+      platf::local_sessions::current().add(session.launch_session_id, session.client_cert.empty() ? addr_string : session.client_cert, session.client_name.empty() ? addr_string : session.client_name, session.view_only, [&session] {
+        stop(session);
+      },
+                                           !session.capture_output.empty(),
+                                           session.recovery_token);
+#endif
 
       // If this is the first session, invoke the platform callbacks
       if (activity.start()) {
@@ -2438,8 +2504,17 @@ namespace stream {
       session->privacy_screen = launch_session.privacy_screen;
       session->clipboard_grant = launch_session.clipboard_grant;
       session->client_cert = launch_session.client_cert;
+      session->view_only = launch_session.view_only;
+#ifdef _WIN32
+      session->client_name = launch_session.client_name;
+      session->recovery_token = launch_session.recovery_token;
+#endif
       session->input_session_id = launch_session.client_cert.empty() ? launch_session.unique_id : launch_session.client_cert;
 
+      session->capture_output = launch_session.capture_output;
+      if (!session->capture_output.empty()) {
+        session->input_session_id += ":" + std::to_string(launch_session.id);
+      }
       session->config = config;
 
       session->control.connect_data = launch_session.control_connect_data;

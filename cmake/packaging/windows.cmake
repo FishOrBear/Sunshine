@@ -77,6 +77,15 @@ set(CPACK_COMPONENT_AUTOSTART_DISPLAY_NAME "Launch on Startup")
 set(CPACK_COMPONENT_AUTOSTART_DESCRIPTION "If enabled, launches Sunshine automatically on system startup.")
 set(CPACK_COMPONENT_AUTOSTART_GROUP "Core")
 
+# Optional, selected by default on the architecture supported by Parsec's driver.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64)$")
+    install(FILES "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/misc/install-parsec-vdd.ps1"
+            DESTINATION "scripts" COMPONENT privacy_display)
+    set(CPACK_COMPONENT_PRIVACY_DISPLAY_DISPLAY_NAME "Parsec Virtual Display Driver")
+    set(CPACK_COMPONENT_PRIVACY_DISPLAY_DESCRIPTION "Download the signed Parsec driver for privacy screen streaming if the adapter is missing.")
+    set(CPACK_COMPONENT_PRIVACY_DISPLAY_GROUP "Core")
+endif()
+
 # assets
 set(CPACK_COMPONENT_ASSETS_DISPLAY_NAME "Required Assets")
 set(CPACK_COMPONENT_ASSETS_DESCRIPTION "Shaders, default box art, and web UI.")

@@ -9,6 +9,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iostream>
 
 // platform includes
@@ -462,6 +463,10 @@ int main(int argc, char *argv[]) {
     BOOST_LOG(error) << "Proc failed to initialize"sv;
   }
 
+  // Credential loading is independent of input setup and GPU validation. Join
+  // before starting any servers that read the HTTP identity.
+  auto http_init = std::async(std::launch::async, http::init);
+
   reed_solomon_init();
   auto input_deinit_guard = input::init();
 
@@ -473,7 +478,7 @@ int main(int argc, char *argv[]) {
     BOOST_LOG(error) << "Video failed to find working encoder"sv;
   }
 
-  if (http::init()) {
+  if (http_init.get()) {
     BOOST_LOG(fatal) << "HTTP interface failed to initialize"sv;
 
 #ifdef _WIN32

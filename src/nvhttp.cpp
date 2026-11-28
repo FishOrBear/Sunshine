@@ -39,11 +39,14 @@
 #include "platform/common.h"
 #ifdef _WIN32
   #include "platform/windows/clipboard.h"
+  #include "platform/windows/desktop_wallpaper.h"
   #include "platform/windows/file_sessions.h"
   #include "platform/windows/host_power.h"
+  #include "platform/windows/local_sessions.h"
 #endif
 #include "process.h"
 #include "rtsp.h"
+#include "session_setup_timing.h"
 #include "string_hash.h"
 #include "system_tray.h"
 #include "utility.h"
@@ -537,11 +540,16 @@ namespace nvhttp {
     std::copy(rikey.cbegin(), rikey.cend(), std::back_inserter(launch_session->gcm_key));
 
     launch_session->host_audio = host_audio;
+    launch_session->view_only = get_arg(args, "viewOnly", "0") == "1";
 #ifdef _WIN32
     launch_session->lock_on_disconnect = config::video.dd.lock_on_disconnect || get_arg(args, "lockOnDisconnect", "0") == "1";
 #endif
     launch_session->privacy_screen = config::video.dd.configuration_option == config::video_t::dd_t::config_option_e::privacy_screen ||
                                      get_arg(args, "privacyScreen", "0") == "1";
+    launch_session->privacy_desktop_size = get_arg(args, "privacyDesktopSize", "");
+    if (args.count("createPrivacyDisplay")) {
+      launch_session->create_privacy_display = get_arg(args, "createPrivacyDisplay") == "1";
+    }
     auto mode = std::stringstream(get_arg(args, "mode", "0x0x0"));
     // Split mode by the char "x", to populate width/height/fps
     int x = 0;
@@ -584,6 +592,7 @@ namespace nvhttp {
     launch_session->client_cert = identity.first;
     launch_session->client_name = identity.second;
 #ifdef _WIN32
+    launch_session->recovery_token = platf::local_sessions::current().recovery_token(identity.first, !args.contains("recoverystream"));
     if (!identity.first.empty()) {
       clipboard::formats_t host {config::nvhttp.clipboard_text, config::nvhttp.clipboard_files, 0, config::nvhttp.file_browser};
       host.images = config::nvhttp.clipboard_images;
@@ -1313,7 +1322,7 @@ namespace nvhttp {
    * @param request HTTP request data from the client.
    */
   template<class T>
-  void serverinfo(std::shared_ptr<typename SimpleWeb::ServerBase<T>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<T>::Request> request, bool host_power = false, bool standalone_files = false) {
+  void serverinfo(std::shared_ptr<typename SimpleWeb::ServerBase<T>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<T>::Request> request, bool host_power = false, bool standalone_files = false, const std::string &recovery_token = {}) {
     print_req<T>(request);
 
     int pair_status = 0;
@@ -1342,12 +1351,17 @@ namespace nvhttp {
 #ifdef _WIN32
     if constexpr (std::is_same_v<SunshineHTTPS, T>) {
       tree.put("root.privacyscreenversion", 1);
+      tree.put("root.displaycontrolversion", 1);
+      tree.put("root.audiohostid", platf::local_sessions::audio_host_id());
     }
 #endif
 
     // Only include the MAC address for requests sent from paired clients over HTTPS.
     // For HTTP requests, use a placeholder MAC address that Moonlight knows to ignore.
     if constexpr (std::is_same_v<SunshineHTTPS, T>) {
+      if (!recovery_token.empty()) {
+        tree.put("root.recoverystream", recovery_token);
+      }
       if (standalone_files) {
         tree.put("root.standalonefileversion", 1);
       }
@@ -1450,6 +1464,7 @@ namespace nvhttp {
    * @param request HTTP request data from the client.
    */
   void launch(bool &host_audio, resp_https_t response, req_https_t request, const std::pair<std::string, std::string> &identity) {
+    session_setup_timing_t timing;
     print_req<SunshineHTTPS>(request);
 
     pt::ptree tree;
@@ -1464,6 +1479,7 @@ namespace nvhttp {
       pt::write_xml(data, tree);
       response->write(data.str());
       response->close_connection_after_response = true;
+      BOOST_LOG(info) << timing.summary("launch", tree.get<int>("root.<xmlattr>.status_code", 0));
 
       if (revert_display_configuration) {
         display_device::revert_configuration();
@@ -1502,6 +1518,10 @@ namespace nvhttp {
       return;
     }
     host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
+#ifdef _WIN32
+    // A new application lifetime must not inherit recovery from a previous run of the same app.
+    platf::local_sessions::current().revoke_recovery();
+#endif
     auto launch_session = make_launch_session(host_audio, args, identity);
 
     const bool no_active_sessions = rtsp_stream::session_count() == 0;
@@ -1519,10 +1539,13 @@ namespace nvhttp {
       // the moment. This should be done before probing encoders as it could
       // change the active displays.
       using enum display_device::configuration_result_e;
-      if (const auto result = display_device::configure_display(config::video, *launch_session); result != ready) {
+      if (const auto result = timing.measure(timing.display, [&] {
+            return display_device::configure_display(config::video, *launch_session);
+          });
+          result != ready) {
         tree.put("root.gamesession", 0);
         tree.put("root.<xmlattr>.status_code", 503);
-        tree.put("root.<xmlattr>.status_message", result == privacy_api_unavailable ? "Privacy screen unavailable. Windows display settings are temporarily unavailable. Unlock the host and try again." : "Privacy screen unavailable. Select a Windows indirect virtual display as the output.");
+        tree.put("root.<xmlattr>.status_message", result == privacy_api_unavailable ? "Privacy screen unavailable. Windows display settings are temporarily unavailable. For a locked host, run Sunshine as a Windows service." : "Privacy screen unavailable. Select a Windows indirect virtual display as the output.");
         return;
       }
 
@@ -1530,7 +1553,7 @@ namespace nvhttp {
       // encoder matches the active GPU (which could have changed
       // due to hotplugging, driver crash, primary monitor change,
       // or any number of other factors).
-      if (video::probe_encoders()) {
+      if (timing.measure(timing.encoder, video::probe_encoders)) {
         tree.put("root.<xmlattr>.status_code", 503);
         tree.put("root.<xmlattr>.status_message", "Failed to initialize video capture/encoding. Is a display connected and turned on?");
         tree.put("root.gamesession", 0);
@@ -1551,7 +1574,9 @@ namespace nvhttp {
     }
 
     if (appid > 0) {
-      auto err = proc::proc.execute((int) appid, launch_session);
+      auto err = timing.measure(timing.app, [&] {
+        return proc::proc.execute((int) appid, launch_session);
+      });
       if (err) {
         tree.put("root.<xmlattr>.status_code", err);
         tree.put("root.<xmlattr>.status_message", "Failed to start the specified application");
@@ -1578,8 +1603,11 @@ namespace nvhttp {
 
     advertise_clipboard(tree, launch_session->clipboard_grant);
 #ifdef _WIN32
+    tree.put("root.recoverystream", launch_session->recovery_token);
     tree.put("root.hostmuteversion", 1);
     tree.put("root.privacyscreenversion", 1);
+    tree.put("root.displaycontrolversion", 1);
+    tree.put("root.bitratesession", launch_session->id);
     tree.put("root.disconnectlocksession", launch_session->id);
 #endif
     if (launch_session->privacy_screen) {
@@ -1599,6 +1627,7 @@ namespace nvhttp {
    * @param request HTTP request data from the client.
    */
   void resume(bool &host_audio, resp_https_t response, req_https_t request, const std::pair<std::string, std::string> &identity) {
+    session_setup_timing_t timing;
     print_req<SunshineHTTPS>(request);
 
     pt::ptree tree;
@@ -1612,6 +1641,7 @@ namespace nvhttp {
       pt::write_xml(data, tree);
       response->write(data.str());
       response->close_connection_after_response = true;
+      BOOST_LOG(info) << timing.summary("resume", tree.get<int>("root.<xmlattr>.status_code", 0));
     });
 
     auto current_appid = proc::proc.running();
@@ -1650,11 +1680,29 @@ namespace nvhttp {
                                    util::from_view(get_arg(args, "localAudioPlayMode")) != 0 :
                                    host_audio;
     const auto launch_session = make_launch_session(requested_audio, args, identity);
+    if (args.contains("recoverystream") && (launch_session->recovery_token.empty() || args.count("recoverystream") != 1 || get_arg(args, "recoverystream") != launch_session->recovery_token || launch_session->appid != current_appid)) {
+      tree.put("root.resume", 0);
+      tree.put("root.<xmlattr>.status_code", 410);
+      tree.put("root.<xmlattr>.status_message", "The original streaming session has ended");
+      return;
+    }
     if (!no_active_sessions && config::video.dd.configuration_option != config::video_t::dd_t::config_option_e::privacy_screen && (launch_session->privacy_screen || rtsp_stream::has_private_session())) {
       tree.put("root.resume", 0);
       tree.put("root.<xmlattr>.status_code", 409);
       tree.put("root.<xmlattr>.status_message", "Privacy screen requires an exclusive streaming session");
       return;
+    }
+    if (args.contains("captureOutput")) {
+      const auto output = get_arg(args, "captureOutput");
+      const auto snapshot = video::capture_displays();
+      if (args.count("captureOutput") != 1 || !rtsp_stream::has_running_session(identity.first) || launch_session->privacy_screen || rtsp_stream::has_private_session() || !snapshot.supports_companion(output)) {
+        tree.put("root.resume", 0);
+        tree.put("root.<xmlattr>.status_code", 409);
+        tree.put("root.<xmlattr>.status_message", "The requested companion display is unavailable");
+        return;
+      }
+      launch_session->capture_output = output;
+      tree.put("root.captureOutput", output);
     }
     host_audio = requested_audio;
 
@@ -1670,10 +1718,13 @@ namespace nvhttp {
       // the moment. This should be done before probing encoders as it could
       // change the active displays.
       using enum display_device::configuration_result_e;
-      if (const auto result = display_device::configure_display(config::video, *launch_session); result != ready) {
+      if (const auto result = timing.measure(timing.display, [&] {
+            return display_device::configure_display(config::video, *launch_session);
+          });
+          result != ready) {
         tree.put("root.resume", 0);
         tree.put("root.<xmlattr>.status_code", 503);
-        tree.put("root.<xmlattr>.status_message", result == privacy_api_unavailable ? "Privacy screen unavailable. Windows display settings are temporarily unavailable. Unlock the host and try again." : "Privacy screen unavailable. Select a Windows indirect virtual display as the output.");
+        tree.put("root.<xmlattr>.status_message", result == privacy_api_unavailable ? "Privacy screen unavailable. Windows display settings are temporarily unavailable. For a locked host, run Sunshine as a Windows service." : "Privacy screen unavailable. Select a Windows indirect virtual display as the output.");
         return;
       }
 
@@ -1681,7 +1732,7 @@ namespace nvhttp {
       // encoder matches the active GPU (which could have changed
       // due to hotplugging, driver crash, primary monitor change,
       // or any number of other factors).
-      if (video::probe_encoders()) {
+      if (timing.measure(timing.encoder, video::probe_encoders)) {
         tree.put("root.resume", 0);
         tree.put("root.<xmlattr>.status_code", 503);
         tree.put("root.<xmlattr>.status_message", "Failed to initialize video capture/encoding. Is a display connected and turned on?");
@@ -1719,8 +1770,11 @@ namespace nvhttp {
 
     advertise_clipboard(tree, launch_session->clipboard_grant);
 #ifdef _WIN32
+    tree.put("root.recoverystream", launch_session->recovery_token);
     tree.put("root.hostmuteversion", 1);
     tree.put("root.privacyscreenversion", 1);
+    tree.put("root.displaycontrolversion", 1);
+    tree.put("root.bitratesession", launch_session->id);
     tree.put("root.disconnectlocksession", launch_session->id);
 #endif
     if (launch_session->privacy_screen) {
@@ -1802,6 +1856,32 @@ namespace nvhttp {
     return cert && is_client_enabled(cert.get());
   }
 
+  /** @brief Send only the interactive user's wallpaper to an enabled paired client. */
+  void handle_desktop_wallpaper(resp_https_t response, const std::string &cert) {
+    using status = SimpleWeb::StatusCode;
+    if (!paired_client_enabled(cert)) {
+      response->write(status::client_error_forbidden);
+      return;
+    }
+
+    const auto image = platf::wallpaper::current();
+    if (!paired_client_enabled(cert)) {
+      response->write(status::client_error_forbidden);
+      return;
+    }
+    SimpleWeb::CaseInsensitiveMultimap headers {{"Cache-Control", "no-store"}};
+    if (!image) {
+      response->write(status::server_error_service_unavailable, headers);
+      return;
+    }
+    if (image->bytes.empty()) {
+      response->write(status::success_no_content, headers);
+      return;
+    }
+    headers.emplace("Content-Type", image->type);
+    response->write(status::success_ok, image->bytes, headers);
+  }
+
   /** @brief Check host consent and active pairing for a power request. */
   bool may_control_host_power(const std::string &pem) {
     return config::nvhttp.host_power && paired_client_enabled(pem);
@@ -1858,6 +1938,78 @@ namespace nvhttp {
     },
                                        platf::lock_workstation);
     response->write(static_cast<status>(code), SimpleWeb::CaseInsensitiveMultimap {{"Cache-Control", "no-store"}});
+  }
+
+  /** @brief List captured outputs, switch capture, or resize an exclusive private desktop. */
+  void handle_display_control(resp_https_t response, req_https_t request, const std::string &cert) {
+    using status = SimpleWeb::StatusCode;
+    const auto header = request->header.find("X-Moonlight-Display");
+    const auto args = request->parse_query_string();
+    if (header == request->header.end() || header->second != "1" || request->header.count("X-Moonlight-Display") != 1 || request->content.size() || args.count("output") + args.count("size") > 1) {
+      response->write(status::client_error_bad_request);
+      return;
+    }
+    if (!paired_client_enabled(cert) || !rtsp_stream::has_running_session(cert)) {
+      response->write(status::client_error_forbidden);
+      return;
+    }
+    const auto snapshot = video::capture_displays();
+    const bool privacy = rtsp_stream::has_private_session();
+    if (args.count("output")) {
+      auto name = get_arg(args, "output");
+      if (privacy || !std::ranges::any_of(snapshot.outputs, [&](const auto &out) {
+            return out.first == name;
+          })) {
+        response->write(status::client_error_conflict);
+        return;
+      }
+      mail::man->event<mail::display_selection_t>(mail::switch_display)->raise(std::string(name));
+    } else if (args.count("size")) {
+      const auto size = get_arg(args, "size");
+      const auto resolution = display_device::parse_privacy_resolution(size);
+      if (!resolution) {
+        response->write(status::client_error_bad_request);
+        return;
+      }
+      if (!privacy || !display_device::resize_privacy_display(*resolution)) {
+        response->write(status::client_error_conflict);
+        return;
+      }
+    }
+    nlohmann::json outputs = nlohmann::json::array();
+    for (const auto &[name, label] : snapshot.outputs) {
+      outputs.push_back({{"id", name}, {"label", label}});
+    }
+    const nlohmann::json data = {{"outputs", outputs}, {"independentOutputs", !privacy && snapshot.parallel_encoding}, {"active", snapshot.active}, {"privacy", privacy}, {"width", snapshot.width}, {"height", snapshot.height}};
+    response->write(status::success_ok, data.dump(), SimpleWeb::CaseInsensitiveMultimap {{"Cache-Control", "no-store"}});
+  }
+
+  /** @brief Change the encoder bitrate for one paired HTTPS streaming session. */
+  void handle_bitrate(resp_https_t response, req_https_t request, const std::string &cert) {
+    using status = SimpleWeb::StatusCode;
+    const auto headers = request->header.equal_range("X-Moonlight-Bitrate");
+    const auto args = request->parse_query_string();
+    const auto value = get_arg(args, "kbps", "");
+    int kbps = 0;
+    const auto parsed = std::from_chars(value.data(), value.data() + value.size(), kbps);
+    if (std::distance(headers.first, headers.second) != 1 || headers.first->second != "1" || request->content.size() || args.count("session") != 1 || args.count("kbps") != 1 || parsed.ec != std::errc() || parsed.ptr != value.data() + value.size() || kbps < 500 || kbps > 500000) {
+      response->write(status::client_error_bad_request);
+      return;
+    }
+    auto result = paired_client_enabled(cert) ? rtsp_stream::request_bitrate(cert, get_arg(args, "session", ""), kbps) : std::future<bool>();
+    if (!result.valid()) {
+      response->write(status::client_error_forbidden);
+      return;
+    }
+    try {
+      if (result.wait_for(std::chrono::seconds(4)) == std::future_status::ready && result.get()) {
+        response->write(status::success_ok, value);
+        return;
+      }
+    } catch (const std::future_error &) {
+      // The streaming session ended before the encoder consumed the request.
+    }
+    response->write(status::server_error_service_unavailable);
   }
 
   /** @brief Apply disconnect locking to the specified active stream and return the effective policy. */
@@ -2354,13 +2506,16 @@ namespace nvhttp {
     https_server.resource["^/serverinfo$"]["GET"] = [&](auto resp, auto req) {
       bool power_enabled = false;
       bool standalone_files = false;
+      std::string recovery_token;
 #ifdef _WIN32
-      if ((config::nvhttp.host_power || config::nvhttp.file_browser) && paired_client_enabled(https_server.client_identity(*req).first)) {
+      const auto cert = https_server.client_identity(*req).first;
+      recovery_token = platf::local_sessions::current().recovery_token(cert);
+      if ((config::nvhttp.host_power || config::nvhttp.file_browser) && paired_client_enabled(cert)) {
         power_enabled = config::nvhttp.host_power;
         standalone_files = config::nvhttp.file_browser;
       }
 #endif
-      serverinfo<SunshineHTTPS>(resp, req, power_enabled, standalone_files);
+      serverinfo<SunshineHTTPS>(resp, req, power_enabled, standalone_files, recovery_token);
     };
     https_server.resource["^/pair$"]["GET"] = [](auto resp, auto req) {
       pair<SunshineHTTPS>(resp, req);
@@ -2376,14 +2531,23 @@ namespace nvhttp {
     https_server.resource["^/cancel$"]["GET"] = cancel;
 
 #ifdef _WIN32
+    https_server.resource["^/desktopwallpaper$"]["GET"] = [&](auto resp, auto req) {
+      handle_desktop_wallpaper(resp, https_server.client_identity(*req).first);
+    };
     https_server.resource["^/hostpower$"]["POST"] = [&](auto resp, auto req) {
       handle_host_power(resp, req, https_server.client_identity(*req).first);
     };
     https_server.resource["^/hostlock$"]["POST"] = [&](auto resp, auto req) {
       handle_host_lock(resp, req, https_server.client_identity(*req).first);
     };
+    https_server.resource["^/bitrate$"]["POST"] = [&](auto resp, auto req) {
+      handle_bitrate(resp, req, https_server.client_identity(*req).first);
+    };
     https_server.resource["^/disconnectlock$"]["POST"] = [&](auto resp, auto req) {
       handle_disconnect_lock(resp, req, https_server.client_identity(*req).first);
+    };
+    https_server.resource["^/displaycontrol$"]["POST"] = [&](auto resp, auto req) {
+      handle_display_control(resp, req, https_server.client_identity(*req).first);
     };
     https_server.resource["^/hostmute$"]["POST"] = [&](auto resp, auto req) {
       handle_host_mute(resp, req, https_server.client_identity(*req).first);

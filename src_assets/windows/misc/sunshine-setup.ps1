@@ -1,6 +1,6 @@
 ﻿# Sunshine Setup Script
 # This script orchestrates the installation and uninstallation of Sunshine
-# Usage: sunshine-setup.ps1 -Action [install|uninstall] [-Silent]
+# Usage: sunshine-setup.ps1 -Action [install|uninstall] [-Silent] [-SkipPrivacyDriver]
 
 param(
     [Parameter(Mandatory=$false)]
@@ -11,7 +11,9 @@ param(
     [string]$Action,
 
     [Parameter(Mandatory=$false)]
-    [switch]$Silent
+    [switch]$Silent,
+
+    [switch]$SkipPrivacyDriver
 )
 
 # Constants
@@ -246,6 +248,9 @@ if (-not $isAdmin) {
     if ($Silent) {
         $arguments += " -Silent"
     }
+    if ($SkipPrivacyDriver) {
+        $arguments += " -SkipPrivacyDriver"
+    }
 
     try {
         # Relaunch the script with elevation
@@ -286,7 +291,9 @@ if ($Action -eq "install") {
         -Color "Yellow"
     Write-Information ""
 
-    $totalSteps = 6
+    $privacyDriverScript = Join-Path $ScriptDir "install-parsec-vdd.ps1"
+    $installPrivacyDriver = !$SkipPrivacyDriver -and (Test-Path -LiteralPath $privacyDriverScript -PathType Leaf)
+    $totalSteps = 6 + [int]$installPrivacyDriver
     $currentStep = 0
 
     # Reset permissions on the install directory
@@ -421,6 +428,16 @@ if ($Action -eq "install") {
         -Description "Configuring autostart" `
         -Emoji "🚀"
     Write-Information ""
+
+    if ($installPrivacyDriver) {
+        Write-Progress -Activity "Installing Sunshine" -Status "Checking the Parsec Virtual Display Driver" -PercentComplete 100
+        try {
+            $driverStatus = & $privacyDriverScript
+            Write-LogMessage -Message "Parsec Virtual Display Driver: $driverStatus"
+        } catch {
+            Write-LogMessage -Message "Parsec Virtual Display Driver setup failed: $($_.Exception.Message)" -Level "Warning"
+        }
+    }
 
     Write-Progress -Activity "Installing Sunshine" -Completed
     Write-FramedText -Message "✓ Sunshine installation completed successfully!" -Level "Success"

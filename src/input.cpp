@@ -462,7 +462,7 @@ namespace input {
     BOOST_LOG(debug) << "Apply Shortcut: 0x"sv << util::hex((std::uint8_t) keyCode).to_string_view();
 
     if (keyCode >= VK_F1 && keyCode <= VK_F13) {
-      mail::man->event<int>(mail::switch_display)->raise(keyCode - VK_F1);
+      mail::man->event<mail::display_selection_t>(mail::switch_display)->raise(keyCode - VK_F1);
       return 1;
     }
 
@@ -2503,7 +2503,7 @@ namespace input {
   /**
    * @brief Allocate and initialize platform input state for a stream.
    */
-  std::shared_ptr<input_t> alloc(safe::mail_t mail, std::string session_id) {
+  std::shared_ptr<input_t> alloc(safe::mail_t mail, std::string session_id, bool wake_desktop) {
     std::shared_ptr<input_t> input;
     bool resumed = false;
     {
@@ -2526,6 +2526,11 @@ namespace input {
       dispatch_input_task([input, mail = std::move(mail)]() {
         rebind_input(input, mail);
       });
+    }
+
+    // A background companion should never move the pointer on the active screen.
+    if (!wake_desktop) {
+      return input;
     }
 
     // Workaround to ensure new frames will be captured when a client connects

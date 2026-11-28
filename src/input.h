@@ -80,9 +80,10 @@ namespace input {
    *
    * @param mail Mailbox used to exchange messages with worker threads.
    * @param session_id Stable paired-client identity shared by launch and resume connections.
+   * @param wake_desktop Move the cursor to wake capture on foreground stream startup.
    * @return Shared input state bound to the stream mailbox.
    */
-  std::shared_ptr<input_t> alloc(safe::mail_t mail, std::string session_id);
+  std::shared_ptr<input_t> alloc(safe::mail_t mail, std::string session_id, bool wake_desktop = true);
 
 #ifdef SUNSHINE_TESTS
   namespace testing {

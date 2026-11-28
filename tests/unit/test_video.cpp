@@ -26,9 +26,131 @@ extern "C" {
 
 // local includes
 #include <src/config.h>
+#include <src/stream.h>
 #include <src/video.h>
+#include <src/video_probe_formats.h>
 
 using namespace std::literals;
+
+namespace video {
+  bool apply_bitrate(std::shared_ptr<stream::session::bitrate_request_t> request, stream::session_t *channel, platf::display_t &display, const encoder_t &encoder, config_t &config, platf::img_t &image, std::unique_ptr<encode_session_t> &session, int frame_nr, safe::mail_raw_t::queue_t<packet_t> &packets, std::optional<std::chrono::steady_clock::time_point> timestamp);
+}
+
+/** @brief Exercise live bitrate changes on one H.264 stream with synthetic frames. */
+TEST(LiveBitrateTest, SwitchesAtKeyframesAndKeepsThePreviousEncoderOnFailure) {
+  struct display_t: platf::display_t {
+    platf::capture_e capture(const push_captured_image_cb_t &, const pull_free_image_cb_t &, bool *) override {
+      return platf::capture_e::ok;
+    }
+
+    std::shared_ptr<platf::img_t> alloc_img() override {
+      return {};
+    }
+
+    int dummy_img(platf::img_t *) override {
+      return 0;
+    }
+
+    std::unique_ptr<platf::avcodec_encode_device_t> make_avcodec_encode_device(platf::pix_fmt_e) override {
+      return std::make_unique<platf::avcodec_encode_device_t>();
+    }
+  } display;
+
+  auto &codec = video::software.h264;
+  const auto saved = codec.capabilities;
+  auto restore = util::fail_guard([&] {
+    codec.capabilities = saved;
+  });
+  codec[video::encoder_t::PASSED] = true;
+  video::config_t config {};
+  config.width = display.width = 320;
+  config.height = display.height = 240;
+  config.framerate = 60;
+  config.slicesPerFrame = 1;
+  std::vector<uint8_t> bgra(config.width * config.height * 4);
+  platf::img_t img {};
+  img.width = config.width;
+  img.height = config.height;
+  img.row_pitch = img.width * 4;
+  img.pixel_pitch = 4;
+  img.data = bgra.data();
+  auto packets = std::make_shared<safe::mail_raw_t>()->queue<video::packet_t>("video");
+  std::unique_ptr<video::encode_session_t> encoder;
+  int index = 100;
+  for (int kbps : {2000, 8000, 14500}) {
+    auto request = std::make_shared<stream::session::bitrate_request_t>();
+    request->bitrate = kbps;
+    auto done = request->result.get_future();
+    ASSERT_TRUE(video::apply_bitrate(request, nullptr, display, video::software, config, img, encoder, index, packets, {}));
+    ASSERT_TRUE(done.get());
+    ASSERT_EQ(config.bitrate, kbps);
+    auto packet = packets->pop(0ms);
+    ASSERT_TRUE(packet);
+    EXPECT_TRUE(packet->is_idr());
+    EXPECT_EQ(packet->frame_index(), index++);
+  }
+  auto original = encoder.get();
+  for (bool expired : {true, false}) {
+    auto request = std::make_shared<stream::session::bitrate_request_t>();
+    request->bitrate = 20000;
+    if (expired) {
+      request->deadline = {};
+    } else {
+      codec[video::encoder_t::PASSED] = false;
+    }
+    auto done = request->result.get_future();
+    EXPECT_FALSE(video::apply_bitrate(request, nullptr, display, video::software, config, img, encoder, index, packets, {}));
+    EXPECT_FALSE(done.get());
+    EXPECT_EQ(encoder.get(), original);
+    EXPECT_EQ(config.bitrate, 14500);
+    EXPECT_FALSE(packets->peek());
+  }
+}
+
+#ifdef _WIN32
+/** @brief A live DXGI stream remains selectable during another stream's monitor enumeration. */
+TEST(CaptureDisplayTest, EnumeratesOutputWhileDesktopDuplicationIsActive) {
+  const auto memory = platf::mem_type_e::system;
+  const auto outputs = platf::display_names(memory);
+  if (outputs.empty()) {
+    GTEST_SKIP() << "No attached output supports desktop duplication";
+  }
+  const auto previous_capture = std::exchange(config::video.capture, "ddx");
+  auto restore = util::fail_guard([&] {
+    config::video.capture = previous_capture;
+  });
+  video::config_t settings {};
+  settings.framerate = 60;
+  const auto &output = outputs.back();
+  auto capture = platf::display(memory, output, settings);
+  ASSERT_TRUE(capture);
+  const auto during_capture = platf::display_names(memory);
+  EXPECT_NE(std::ranges::find(during_capture, output), during_capture.end());
+  capture.reset();
+  auto reopened = platf::display(memory, output, settings);
+  EXPECT_TRUE(reopened);
+}
+#endif
+
+/** @brief Only enumerated capture outputs on parallel encoders accept companion streams. */
+TEST(CaptureDisplayTest, CompanionRequiresNamedOutputAndParallelEncoder) {
+  video::capture_displays_t snapshot;
+  snapshot.outputs = {{"A", "left"}, {"B", "right"}};
+  EXPECT_FALSE(snapshot.supports_companion("B"));
+  snapshot.parallel_encoding = true;
+  EXPECT_TRUE(snapshot.supports_companion("B"));
+  EXPECT_FALSE(snapshot.supports_companion(""));
+  EXPECT_FALSE(snapshot.supports_companion("missing"));
+}
+
+/** @brief A named click survives enumeration reordering and removal while keyboard indices remain clamped. */
+TEST(CaptureDisplayTest, ResolvesNamedAndIndexedRequests) {
+  const std::vector<std::string> names {"B", "A"};
+  EXPECT_EQ(video::resolve_display("A"s, names, 0), 1);
+  EXPECT_EQ(video::resolve_display("gone"s, names, 1), 1);
+  EXPECT_EQ(video::resolve_display(-1, names, 1), 0);
+  EXPECT_EQ(video::resolve_display(9, names, 0), 1);
+}
 
 /**
  * @brief Packet replacement rules retain the original non-owning byte views.
@@ -54,6 +176,66 @@ TEST(VideoPacketReplacementTest, CopiesViewsWithoutCopyingTheirBackingBytes) {
   EXPECT_EQ(rule.old, "Old");
   EXPECT_EQ(rule._new, "New");
 }
+
+TEST(VideoEncoderProbingTest, GroupsCaptureDepthsAndKeepsPerFormatResults) {
+  video::encoder_t encoder {"test"sv, {}, {}, {}, {}, 0};
+  for (auto codec : {&encoder.h264, &encoder.hevc, &encoder.av1}) {
+    codec->capabilities.set();
+  }
+  using mode = std::tuple<int, int, int>;
+  std::vector<mode> calls;
+  video::probe_optional_formats(encoder, true, [&](const video::config_t &config) {
+    calls.emplace_back(config.videoFormat, config.dynamicRange, config.chromaSamplingType);
+    return config.videoFormat != 2 || !config.chromaSamplingType;
+  });
+  const std::vector<mode> expected {{0, 0, 1}, {1, 0, 1}, {2, 0, 1}, {1, 1, 0}, {1, 1, 1}, {2, 1, 0}, {2, 1, 1}};
+  EXPECT_EQ(calls, expected);
+  EXPECT_TRUE(encoder.h264[video::encoder_t::YUV444]);
+  EXPECT_FALSE(encoder.h264[video::encoder_t::DYNAMIC_RANGE]);
+  EXPECT_TRUE(encoder.hevc[video::encoder_t::DYNAMIC_RANGE_YUV444]);
+  EXPECT_TRUE(encoder.av1[video::encoder_t::DYNAMIC_RANGE]);
+  EXPECT_FALSE(encoder.av1[video::encoder_t::YUV444]);
+  EXPECT_FALSE(encoder.av1[video::encoder_t::DYNAMIC_RANGE_YUV444]);
+}
+
+TEST(VideoEncoderProbingTest, SkipsUnavailableCodecsAndUnsupportedChroma) {
+  video::encoder_t encoder {"test"sv, {}, {}, {}, {}, 0};
+  encoder.hevc.capabilities.set();
+  int calls = 0;
+  video::probe_optional_formats(encoder, false, [&](const video::config_t &config) {
+    ++calls;
+    EXPECT_EQ(config.videoFormat, 1);
+    EXPECT_EQ(config.dynamicRange, 1);
+    EXPECT_EQ(config.chromaSamplingType, 0);
+    return false;
+  });
+  EXPECT_EQ(calls, 1);
+  EXPECT_FALSE(encoder.hevc[video::encoder_t::DYNAMIC_RANGE]);
+  EXPECT_FALSE(encoder.hevc[video::encoder_t::YUV444]);
+  EXPECT_FALSE(encoder.hevc[video::encoder_t::DYNAMIC_RANGE_YUV444]);
+}
+
+#ifdef _WIN32
+TEST(VideoEncoderProbingTest, WarmProbeRequiresTheSameKnownDisplayTopology) {
+  display_device::EnumeratedDevice panel;
+  panel.m_device_id = "panel";
+  panel.m_info.emplace();
+  panel.m_info->m_primary = true;
+  display_device::EnumeratedDevice virtual_output;
+  virtual_output.m_device_id = "virtual";
+  const display_device::EnumeratedDeviceList original {panel, virtual_output};
+
+  EXPECT_TRUE(video::matching_probe_displays(original, {virtual_output, panel}));
+  EXPECT_FALSE(video::matching_probe_displays({}, {}));
+  EXPECT_FALSE(video::matching_probe_displays(original, {}));
+  EXPECT_FALSE(video::matching_probe_displays(original, {panel}));
+  panel.m_info->m_resolution.m_width = 1920;
+  EXPECT_FALSE(video::matching_probe_displays(original, {panel, virtual_output}));
+  panel.m_info.reset();
+  virtual_output.m_info.emplace();
+  EXPECT_FALSE(video::matching_probe_displays(original, {panel, virtual_output}));
+}
+#endif
 
 TEST(VideoEncoderProbingTest, AllowsProbingWhenNoDevicesAreEnumerated) {
   EXPECT_TRUE(video::allow_encoder_probing({}));

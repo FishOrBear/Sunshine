@@ -36,6 +36,7 @@ extern "C" {
 #include "platform/common.h"
 #include "sync.h"
 #include "video.h"
+#include "video_probe_formats.h"
 
 #ifdef _WIN32
   #include "platform/windows/clipboard.h"
@@ -48,6 +49,47 @@ extern "C" {
 using namespace std::literals;
 
 namespace video {
+
+  static std::mutex capture_displays_mutex;  ///< Serializes capture snapshots.
+  static capture_displays_t capture_snapshot;  ///< Last successfully opened capture source.
+
+  bool capture_displays_t::supports_companion(const std::string &output) const {
+    return parallel_encoding && !output.empty() && std::ranges::any_of(outputs, [&](const auto &entry) {
+             return entry.first == output;
+           });
+  }
+
+  capture_displays_t capture_displays() {
+    std::lock_guard lock {capture_displays_mutex};
+    return capture_snapshot;
+  }
+
+  /** @brief Publish monitor labels only after the capture device opened successfully. */
+  static void publish_displays(const std::vector<std::string> &names, int index, const platf::display_t &display, bool parallel_encoding) {
+#ifdef _WIN32
+    capture_displays_t snapshot;
+    const auto devices = display_device::enumerate_devices();
+    for (const auto &name : names) {
+      auto device = std::ranges::find(devices, name, &display_device::EnumeratedDevice::m_display_name);
+      snapshot.outputs.emplace_back(name, device == devices.end() ? "" : device->m_friendly_name);
+    }
+    snapshot.parallel_encoding = parallel_encoding;
+    snapshot.active = names.at(index);
+    snapshot.width = display.width;
+    snapshot.height = display.height;
+    std::lock_guard lock {capture_displays_mutex};
+    capture_snapshot = std::move(snapshot);
+#endif
+  }
+
+  /** @brief Resolve a shortcut or named selection against the newly enumerated outputs. */
+  int resolve_display(const mail::display_selection_t &request, const std::vector<std::string> &names, int current) {
+    if (const auto *index = std::get_if<int>(&request)) {
+      return std::clamp(*index, 0, static_cast<int>(names.size()) - 1);
+    }
+    const auto found = std::ranges::find(names, std::get<std::string>(request));
+    return found == names.end() ? current : static_cast<int>(found - names.begin());
+  }
 
   bool allow_encoder_probing(const std::vector<display_device::EnumeratedDevice> &devices) {
     // If there are no devices, then either the API is not working correctly or OS does not support the lib.
@@ -468,8 +510,6 @@ namespace video {
       device = std::move(other.device);
       avcodec_ctx = std::move(other.avcodec_ctx);
       replacements = std::move(other.replacements);
-      sps = std::move(other.sps);
-      vps = std::move(other.vps);
       frame_timestamps = std::move(other.frame_timestamps);
 
       inject = other.inject;
@@ -526,10 +566,12 @@ namespace video {
     avcodec_ctx_t avcodec_ctx;  ///< FFmpeg codec context owned by the encode session.
     std::unique_ptr<platf::avcodec_encode_device_t> device;  ///< Platform device used by the FFmpeg hardware encoder.
 
-    std::vector<packet_raw_t::replace_t> replacements;  ///< NAL-unit byte ranges that must be replaced before packet send.
-
-    cbs::nal_t sps;  ///< Original and rewritten sequence parameter set for IDR injection.
-    cbs::nal_t vps;  ///< Original and rewritten HEVC video parameter set for IDR injection.
+    /** @brief Keep parameter-set bytes and their views alive until queued IDRs are sent. */
+    struct parameter_sets_t {
+      cbs::nal_t sps, vps;  ///< Backing bytes for the replacement views.
+      std::vector<packet_raw_t::replace_t> rules;  ///< Rules applied by the packet sender.
+    };
+    std::shared_ptr<parameter_sets_t> replacements = std::make_shared<parameter_sets_t>();  ///< Shared with queued IDRs.
 
     // inject sps/vps data into idr pictures
     int inject;  ///< Number of upcoming IDR frames that should receive rewritten parameter sets.
@@ -768,6 +810,8 @@ namespace video {
    * @return 0 when the capture thread is started; nonzero on setup failure.
    */
   int start_capture_async(capture_thread_async_ctx_t &ctx);
+  /** @brief Start a capture worker for a named output, or the shared output when empty. */
+  int start_output_capture(capture_thread_async_ctx_t &ctx, const std::string &output);
   /**
    * @brief Stop capture async processing.
    *
@@ -1602,12 +1646,14 @@ namespace video {
    * @param display_wp Weak pointer holder for the active display.
    * @param reinit_event Signal raised while the display is being reinitialized.
    * @param encoder Selected encoder.
+   * @param output Independent output name, empty for the shared switchable capture.
    */
   void captureThread(
     std::shared_ptr<safe::queue_t<capture_ctx_t>> capture_ctx_queue,
     sync_util::sync_t<std::weak_ptr<platf::display_t>> &display_wp,
     safe::signal_t &reinit_event,
-    const encoder_t &encoder
+    const encoder_t &encoder,
+    const std::string &output
   ) {
     std::vector<capture_ctx_t> capture_ctxs;
 
@@ -1623,7 +1669,7 @@ namespace video {
       }
     });
 
-    auto switch_display_event = mail::man->event<int>(mail::switch_display);
+    auto switch_display_event = mail::man->event<mail::display_selection_t>(mail::switch_display);
 
     // Wait for the initial capture context or a request to stop the queue
     auto initial_capture_ctx = capture_ctx_queue->pop();
@@ -1636,10 +1682,16 @@ namespace video {
     // get the most up-to-date list available monitors
     std::vector<std::string> display_names;
     int display_p = -1;
-    refresh_displays(encoder.platform_formats->dev_type, display_names, display_p);
-    auto disp = platf::display(encoder.platform_formats->dev_type, display_names[display_p], capture_ctxs.front().config);
+    if (output.empty()) {
+      refresh_displays(encoder.platform_formats->dev_type, display_names, display_p);
+    }
+    const auto &capture_name = output.empty() ? display_names[display_p] : output;
+    auto disp = platf::display(encoder.platform_formats->dev_type, capture_name, capture_ctxs.front().config);
     if (!disp) {
       return;
+    }
+    if (output.empty()) {
+      publish_displays(display_names, display_p, *disp, true);
     }
     display_wp = disp;
 
@@ -1747,7 +1799,7 @@ namespace video {
     while (capture_ctx_queue->running()) {
       bool artificial_reinit = false;
 
-      auto push_captured_image_callback = [&capture_ctxs, &capture_ctx_queue, &switch_display_event, &artificial_reinit](std::shared_ptr<platf::img_t> &&img, bool frame_captured) {
+      auto push_captured_image_callback = [&capture_ctxs, &capture_ctx_queue, &switch_display_event, &artificial_reinit, &output](std::shared_ptr<platf::img_t> &&img, bool frame_captured) {
         KITTY_WHILE_LOOP(auto capture_ctx = std::begin(capture_ctxs), capture_ctx != std::end(capture_ctxs), {
           if (!capture_ctx->images->running()) {
             capture_ctx = capture_ctxs.erase(capture_ctx);
@@ -1770,7 +1822,7 @@ namespace video {
           capture_ctxs.emplace_back(std::move(*capture_ctx_queue->pop()));
         }
 
-        if (switch_display_event->peek()) {
+        if (output.empty() && switch_display_event->peek()) {
           artificial_reinit = true;
           return false;
         }
@@ -1825,15 +1877,23 @@ namespace video {
               disp.reset();
 
               // Refresh display names since a display removal might have caused the reinitialization
-              refresh_displays(encoder.platform_formats->dev_type, display_names, display_p);
+              if (output.empty()) {
+                refresh_displays(encoder.platform_formats->dev_type, display_names, display_p);
+              }
 
               // Process any pending display switch with the new list of displays
-              if (switch_display_event->peek()) {
-                display_p = std::clamp(*switch_display_event->pop(), 0, static_cast<int>(display_names.size()) - 1);
+              if (output.empty() && switch_display_event->peek()) {
+                display_p = resolve_display(*switch_display_event->pop(), display_names, display_p);
               }
 
               // reset_display() will sleep between retries
-              reset_display(disp, encoder.platform_formats->dev_type, display_names[display_p], capture_ctxs.front().config);
+              if (capture_ctxs.empty()) {
+                return;
+              }
+              reset_display(disp, encoder.platform_formats->dev_type, output.empty() ? display_names[display_p] : output, capture_ctxs.front().config);
+              if (!disp && !output.empty()) {
+                return;
+              }
               if (disp) {
                 break;
               }
@@ -1842,6 +1902,9 @@ namespace video {
               return;
             }
 
+            if (output.empty()) {
+              publish_displays(display_names, display_p, *disp, true);
+            }
             display_wp = disp;
 
             reinit_event.reset();
@@ -1902,8 +1965,8 @@ namespace video {
 
     auto &ctx = session.avcodec_ctx;
 
-    auto &sps = session.sps;
-    auto &vps = session.vps;
+    auto &sps = session.replacements->sps;
+    auto &vps = session.replacements->vps;
 
     // send the frame to the encoder
     auto ret = avcodec_send_frame(ctx.get(), frame);
@@ -1944,7 +2007,7 @@ namespace video {
           sps = std::move(hevc.sps);
           vps = std::move(hevc.vps);
 
-          session.replacements.emplace_back(
+          session.replacements->rules.emplace_back(
             std::string_view(reinterpret_cast<const char *>(std::begin(vps.old)), vps.old.size()),
             std::string_view(reinterpret_cast<const char *>(std::begin(vps._new)), vps._new.size())
           );
@@ -1952,7 +2015,7 @@ namespace video {
 
         session.inject = 0;
 
-        session.replacements.emplace_back(
+        session.replacements->rules.emplace_back(
           std::string_view(reinterpret_cast<const char *>(std::begin(sps.old)), sps.old.size()),
           std::string_view(reinterpret_cast<const char *>(std::begin(sps._new)), sps._new.size())
         );
@@ -1960,7 +2023,9 @@ namespace video {
 
       packet->frame_timestamp = match_frame_timestamp(session.frame_timestamps, av_packet->pts);
 
-      packet->replacements = &session.replacements;
+      if (packet->is_idr() && !session.replacements->rules.empty()) {
+        packet->replacements = {session.replacements, &session.replacements->rules};
+      }
       packet->channel_data = channel_data;
       packets->raise(std::move(packet));
     }
@@ -2504,6 +2569,53 @@ namespace video {
     return nullptr;
   }
 
+  std::unique_ptr<platf::encode_device_t> make_encode_device(platf::display_t &disp, const encoder_t &encoder, const config_t &config);
+
+  /** @brief Switch the current stream's encoder at an IDR frame while preserving its capture and transport. */
+  bool apply_bitrate(std::shared_ptr<stream::session::bitrate_request_t> request, stream::session_t *channel, platf::display_t &display, const encoder_t &encoder, config_t &config, platf::img_t &image, std::unique_ptr<encode_session_t> &session, int frame_nr, safe::mail_raw_t::queue_t<packet_t> &packets, std::optional<std::chrono::steady_clock::time_point> timestamp) {
+    if (!request) {
+      return false;
+    }
+    bool applied = false;
+    auto complete = util::fail_guard([&] {
+      request->result.set_value(applied);
+    });
+    if (std::chrono::steady_clock::now() >= request->deadline) {
+      return false;
+    }
+    auto next_config = config;
+    next_config.bitrate = request->bitrate;
+    auto device = make_encode_device(display, encoder, next_config);
+    if (!device) {
+      return false;
+    }
+    auto next = make_encode_session(&display, encoder, next_config, image.width, image.height, std::move(device));
+    if (!next || next->convert(image) || std::chrono::steady_clock::now() >= request->deadline) {
+      return false;
+    }
+    next->request_idr_frame();
+    auto staged = std::make_shared<safe::mail_raw_t>()->queue<packet_t>(mail::video_packets);
+    if (encode(frame_nr, *next, staged, channel, timestamp)) {
+      return false;
+    }
+    auto first = staged->pop(0ms);
+    if (!first || !first->is_idr() || first->frame_index() != frame_nr || std::chrono::steady_clock::now() >= request->deadline) {
+      return false;
+    }
+    next->request_normal_frame();
+    packets->raise(std::move(first));
+    session.swap(next);
+    if (next && (encoder.flags & ASYNC_TEARDOWN)) {
+      std::jthread {[old = std::move(next)]() mutable {
+        old.reset();
+      }}.detach();
+    }
+    config.bitrate = next_config.bitrate;
+    applied = true;
+    BOOST_LOG(info) << "Live encoder bitrate: " << config.bitrate << " kbps";
+    return true;
+  }
+
   /**
    * @brief Run one encode loop for a display capture stream.
    *
@@ -2521,7 +2633,7 @@ namespace video {
     int &frame_nr,  // Store progress of the frame number
     safe::mail_t mail,
     img_event_t images,
-    config_t config,
+    config_t &config,
     std::shared_ptr<platf::display_t> disp,
     std::unique_ptr<platf::encode_device_t> encode_device,
     safe::signal_t &reinit_event,
@@ -2560,13 +2672,14 @@ namespace video {
     auto idr_events = mail->event<bool>(mail::idr);
     auto invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
 
+    std::shared_ptr<platf::img_t> last_image;
     {
       // Load a dummy image into the AVFrame to ensure we have something to encode
       // even if we timeout waiting on the first frame. This is a relatively large
       // allocation which can be freed immediately after convert(), so we do this
       // in a separate scope.
-      auto dummy_img = disp->alloc_img();
-      if (!dummy_img || disp->dummy_img(dummy_img.get()) || session->convert(*dummy_img)) {
+      last_image = disp->alloc_img();
+      if (!last_image || disp->dummy_img(last_image.get()) || session->convert(*last_image)) {
         return;
       }
     }
@@ -2594,6 +2707,7 @@ namespace video {
       // Encode at a minimum FPS to avoid image quality issues with static content
       if (!requested_idr_frame || images->peek()) {
         if (auto img = images->pop(max_frametime)) {
+          last_image = img;
           frame_timestamp = img->frame_timestamp;
           if (session->convert(*img)) {
             BOOST_LOG(error) << "Could not convert image"sv;
@@ -2618,6 +2732,10 @@ namespace video {
         break;
       }
 
+      if (apply_bitrate(stream::session::take_bitrate_request(*channel_data), channel_data, *disp, encoder, config, *last_image, session, frame_nr, packets, frame_timestamp)) {
+        ++frame_nr;
+        continue;
+      }
       if (encode(frame_nr++, *session, packets, channel_data, frame_timestamp)) {
         BOOST_LOG(error) << "Could not encode video packet"sv;
         return;
@@ -2816,7 +2934,7 @@ namespace video {
 
     std::shared_ptr<platf::display_t> disp;
 
-    auto switch_display_event = mail::man->event<int>(mail::switch_display);
+    auto switch_display_event = mail::man->event<mail::display_selection_t>(mail::switch_display);
 
     if (synced_session_ctxs.empty()) {
       auto ctx = encode_session_ctx_queue.pop();
@@ -2833,7 +2951,7 @@ namespace video {
 
       // Process any pending display switch with the new list of displays
       if (switch_display_event->peek()) {
-        display_p = std::clamp(*switch_display_event->pop(), 0, static_cast<int>(display_names.size()) - 1);
+        display_p = resolve_display(*switch_display_event->pop(), display_names, display_p);
       }
 
       // reset_display() will sleep between retries
@@ -2847,6 +2965,7 @@ namespace video {
       return encode_e::capture_error;
     }
 
+    publish_displays(display_names, display_p, *disp, false);
     auto img = disp->alloc_img();
     if (!img || disp->dummy_img(img.get())) {
       return encode_e::capture_error;
@@ -2917,6 +3036,11 @@ namespace video {
             frame_timestamp = captured_image->frame_timestamp;
           }
 
+          if (apply_bitrate(stream::session::take_bitrate_request(*ctx->channel_data), ctx->channel_data, *disp, encoder, ctx->config, *img, pos->session, ctx->frame_nr, ctx->packets, frame_timestamp)) {
+            ++ctx->frame_nr;
+            ++pos;
+            continue;
+          }
           if (encode(ctx->frame_nr++, *pos->session, ctx->packets, ctx->channel_data, frame_timestamp)) {
             BOOST_LOG(error) << "Could not encode video packet"sv;
             ctx->shutdown_event->raise(true);
@@ -2995,11 +3119,13 @@ namespace video {
    * @param mail Session mail bus.
    * @param config Video configuration.
    * @param channel_data Stream session carried with each encoded packet.
+   * @param ctx Capture worker feeding this encoder.
    */
   void capture_async(
     safe::mail_t mail,
     config_t &config,
-    stream::session_t *channel_data
+    stream::session_t *channel_data,
+    capture_thread_async_ctx_t &ctx
   ) {
     auto shutdown_event = mail->event<bool>(mail::shutdown);
 
@@ -3009,14 +3135,9 @@ namespace video {
       shutdown_event->raise(true);
     });
 
-    auto ref = capture_thread_async.ref();
-    if (!ref) {
-      return;
-    }
+    ctx.capture_ctx_queue->raise(capture_ctx_t {images, config});
 
-    ref->capture_ctx_queue->raise(capture_ctx_t {images, config});
-
-    if (!ref->capture_ctx_queue->running()) {
+    if (!ctx.capture_ctx_queue->running()) {
       return;
     }
 
@@ -3030,19 +3151,19 @@ namespace video {
 
     while (!shutdown_event->peek() && images->running()) {
       // Wait for the main capture event when the display is being reinitialized
-      if (ref->reinit_event.peek()) {
+      if (ctx.reinit_event.peek()) {
         std::this_thread::sleep_for(20ms);
         continue;
       }
       // Wait for the display to be ready
       std::shared_ptr<platf::display_t> display;
       {
-        auto display_lock = ref->display_wp.lock();
-        if (ref->display_wp->expired()) {
+        auto display_lock = ctx.display_wp.lock();
+        if (ctx.display_wp->expired()) {
           continue;
         }
 
-        display = ref->display_wp->lock();
+        display = ctx.display_wp->lock();
       }
 
       auto &encoder = *chosen_encoder;
@@ -3073,8 +3194,8 @@ namespace video {
         config,
         display,
         std::move(encode_device),
-        ref->reinit_event,
-        *ref->encoder_p,
+        ctx.reinit_event,
+        *ctx.encoder_p,
         channel_data
       );
     }
@@ -3086,19 +3207,31 @@ namespace video {
    * @param mail Session mail bus.
    * @param config Client-requested video configuration, normalized before capture begins.
    * @param channel_data Stream session carried with each encoded packet.
+   * @param output Optional independent capture output.
    */
   void capture(
     safe::mail_t mail,
     config_t config,
-    stream::session_t *channel_data
+    stream::session_t *channel_data,
+    const std::string &output
   ) {
     config = resolve_dynamic_range(*chosen_encoder, config);
 
     auto idr_events = mail->event<bool>(mail::idr);
 
     idr_events->raise(true);
-    if (chosen_encoder->flags & PARALLEL_ENCODING) {
-      capture_async(std::move(mail), config, channel_data);
+    if (!output.empty()) {
+      capture_thread_async_ctx_t ctx;
+      start_output_capture(ctx, output);
+      auto stop = util::fail_guard([&] {
+        end_capture_async(ctx);
+      });
+      capture_async(std::move(mail), config, channel_data, ctx);
+    } else if (chosen_encoder->flags & PARALLEL_ENCODING) {
+      auto ref = capture_thread_async.ref();
+      if (ref) {
+        capture_async(std::move(mail), config, channel_data, *ref.get());
+      }
     } else {
       safe::signal_t join_event;
       auto ref = capture_thread_sync.ref();
@@ -3298,80 +3431,24 @@ namespace video {
       encoder.av1.capabilities.reset();
     }
 
-    // Test HDR and YUV444 support
-    {
-      auto test_yuv444 = [&](auto &flag_map, auto video_format) {
-        const config_t config = {1920, 1080, 60, 6000, 1000, 1, 0, 1, video_format, 0, 1, 0};
-
+    // DDX and WGC capture initialization depends on frame rate and dynamic range.
+    // Every probe here uses the same frame rate, output and memory type. Keep the
+    // capture device within this validation pass; each format gets a fresh encoder.
+#ifdef _WIN32
+    int capture_range = config_autoselect.dynamicRange;
+#endif
+    probe_optional_formats(encoder, encoder.flags & YUV444_SUPPORT, [&](const config_t &config) {
+#ifdef _WIN32
+      if (!disp || capture_range != config.dynamicRange) {
+        capture_range = config.dynamicRange;
         reset_display(disp, encoder.platform_formats->dev_type, output_name, config);
-        if (!disp) {
-          return;
-        }
-        if (!flag_map[encoder_t::PASSED]) {
-          return;
-        }
-
-        auto encoder_codec_name = encoder.codec_from_config(config).name;
-
-        if ((encoder.flags & YUV444_SUPPORT) && disp->is_codec_supported(encoder_codec_name, config) && validate_config(disp, encoder, config) >= 0) {
-          flag_map[encoder_t::YUV444] = true;
-        } else {
-          flag_map[encoder_t::YUV444] = false;
-        }
-      };
-
-      auto test_yuv420_hdr = [&](auto &flag_map, auto video_format) {
-        const config_t config = {1920, 1080, 60, 6000, 1000, 1, 0, 3, video_format, 1, 0, 0};
-
-        reset_display(disp, encoder.platform_formats->dev_type, output_name, config);
-        if (!disp) {
-          return;
-        }
-        if (!flag_map[encoder_t::PASSED]) {
-          return;
-        }
-
-        auto encoder_codec_name = encoder.codec_from_config(config).name;
-
-        if (disp->is_codec_supported(encoder_codec_name, config) && validate_config(disp, encoder, config) >= 0) {
-          flag_map[encoder_t::DYNAMIC_RANGE] = true;
-        } else {
-          flag_map[encoder_t::DYNAMIC_RANGE] = false;
-        }
-      };
-
-      auto test_yuv444_hdr = [&](auto &flag_map, auto video_format) {
-        const config_t config = {1920, 1080, 60, 6000, 1000, 1, 0, 3, video_format, 1, 1, 0};
-
-        reset_display(disp, encoder.platform_formats->dev_type, output_name, config);
-        if (!disp) {
-          return;
-        }
-        if (!flag_map[encoder_t::PASSED]) {
-          return;
-        }
-
-        auto encoder_codec_name = encoder.codec_from_config(config).name;
-
-        if ((encoder.flags & YUV444_SUPPORT) && disp->is_codec_supported(encoder_codec_name, config) && validate_config(disp, encoder, config) >= 0) {
-          flag_map[encoder_t::DYNAMIC_RANGE_YUV444] = true;
-        } else {
-          flag_map[encoder_t::DYNAMIC_RANGE_YUV444] = false;
-        }
-      };
-
-      test_yuv444(encoder.h264, 0);
-      // HDR is not supported with H.264. Don't bother even trying it.
-      encoder.h264[encoder_t::DYNAMIC_RANGE] = false;
-      encoder.h264[encoder_t::DYNAMIC_RANGE_YUV444] = false;
-
-      test_yuv444(encoder.hevc, 1);
-      test_yuv420_hdr(encoder.hevc, 1);
-      test_yuv444_hdr(encoder.hevc, 1);
-      test_yuv444(encoder.av1, 2);
-      test_yuv420_hdr(encoder.av1, 2);
-      test_yuv444_hdr(encoder.av1, 2);
-    }
+      }
+#else
+      reset_display(disp, encoder.platform_formats->dev_type, output_name, config);
+#endif
+      return disp && disp->is_codec_supported(encoder.codec_from_config(config).name, config) &&
+             validate_config(disp, encoder, config) >= 0;
+    });
 
     encoder.h264[encoder_t::VUI_PARAMETERS] = encoder.h264[encoder_t::VUI_PARAMETERS] && !config::sunshine.flags[config::flag::FORCE_VIDEO_HEADER_REPLACE];
     encoder.hevc[encoder_t::VUI_PARAMETERS] = encoder.hevc[encoder_t::VUI_PARAMETERS] && !config::sunshine.flags[config::flag::FORCE_VIDEO_HEADER_REPLACE];
@@ -3417,17 +3494,33 @@ namespace video {
   }
 
   int probe_encoders() {
-    if (!allow_encoder_probing(display_device::enumerate_devices())) {
-      // Error already logged
+    auto devices = display_device::enumerate_devices();
+#ifdef _WIN32
+    static display_device::EnumeratedDeviceList probed_devices;
+#endif
+    if (!allow_encoder_probing(devices)) {
+#ifdef _WIN32
+      probed_devices.clear();
+#endif
       return -1;
     }
 
-    auto encoder_list = encoders;
-
-    // If we already have a good encoder, check to see if another probe is required
-    if (chosen_encoder && !(chosen_encoder->flags & ALWAYS_REPROBE) && !platf::needs_encoder_reenumeration()) {
+#ifdef _WIN32
+    // Establish the DXGI generation *before* every full probe, including startup.
+    // Changes during validation will invalidate the factory on the next call.
+    const bool gpu_changed = platf::needs_encoder_reenumeration();
+    const bool reuse = chosen_encoder && !(chosen_encoder->flags & ALWAYS_REPROBE) &&
+                       !gpu_changed && matching_probe_displays(probed_devices, devices);
+#else
+    const bool reuse = chosen_encoder && !(chosen_encoder->flags & ALWAYS_REPROBE) && !platf::needs_encoder_reenumeration();
+#endif
+    if (reuse) {
+      BOOST_LOG(info) << "Encoder probe: reusing "sv << chosen_encoder->name;
       return 0;
     }
+
+    BOOST_LOG(info) << "Encoder probe: full validation"sv;
+    auto encoder_list = encoders;
 
     // Restart encoder selection
     auto previous_encoder = chosen_encoder;
@@ -3649,6 +3742,9 @@ namespace video {
       BOOST_LOG(debug) << "ENCODER STATUS ACTIVE_AV1_MODE: "sv << active_av1_mode;
     }
 
+#ifdef _WIN32
+    probed_devices = std::move(devices);
+#endif
     return 0;
   }
 
@@ -3774,6 +3870,10 @@ namespace video {
    * @brief Start capture async.
    */
   int start_capture_async(capture_thread_async_ctx_t &capture_thread_ctx) {
+    return start_output_capture(capture_thread_ctx, {});
+  }
+
+  int start_output_capture(capture_thread_async_ctx_t &capture_thread_ctx, const std::string &output) {
     capture_thread_ctx.encoder_p = chosen_encoder;
     capture_thread_ctx.reinit_event.reset();
 
@@ -3784,7 +3884,8 @@ namespace video {
       capture_thread_ctx.capture_ctx_queue,
       std::ref(capture_thread_ctx.display_wp),
       std::ref(capture_thread_ctx.reinit_event),
-      std::ref(*capture_thread_ctx.encoder_p)
+      std::ref(*capture_thread_ctx.encoder_p),
+      output
     };
 
     return 0;

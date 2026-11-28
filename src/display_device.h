@@ -97,6 +97,12 @@ namespace display_device {
    * @return True only when the topology was read successfully and contains only that virtual target.
    */
   [[nodiscard]] bool privacy_screen_active();
+  /** @brief Apply a desktop mode to the verified exclusive virtual display during capture. */
+  bool resize_privacy_display(const Resolution &resolution);
+  /** @brief Match requested mode fields to the active device with the same ID. */
+  bool matches_privacy_mode(const EnumeratedDeviceList &devices, const SingleDisplayConfiguration &desired);
+  /** @brief Parse a bounded desktop resolution supplied by a paired client. */
+  std::optional<Resolution> parse_privacy_resolution(const std::string &size);
 
   /**
    * @brief Configure the display device using the provided configuration.
@@ -197,6 +203,15 @@ namespace display_device {
 #ifdef SUNSHINE_TESTS
   class SettingsManagerInterface;
   class SettingsPersistenceInterface;
+  #ifdef _WIN32
+  class WinApiLayerInterface;
+
+  /**
+   * @brief Supply simulated Windows display paths for privacy session tests.
+   * @param api CCD interface used until test_reset_display_device().
+   */
+  void test_set_display_api(std::shared_ptr<WinApiLayerInterface> api);
+  #endif
 
   /**
    * @brief Create in-memory persistence that records whether settings are still stored.

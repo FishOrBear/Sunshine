@@ -635,6 +635,7 @@ namespace platf::dxgi {
   class duplication_t {
   public:
     dup_t dup;  ///< Desktop Duplication capture session.
+    HMONITOR captured_monitor {};  ///< Output registered for enumeration while this duplicator is alive.
     bool has_frame {};  ///< Whether a frame is currently held by the duplication object.
     std::chrono::steady_clock::time_point last_protected_content_warning_time {};  ///< Last protected content warning time.
 

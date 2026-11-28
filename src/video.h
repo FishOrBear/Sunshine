@@ -10,6 +10,7 @@
 #include <optional>
 #include <string_view>
 #include <utility>
+#include <variant>
 #include <vector>
 
 // local includes
@@ -34,6 +35,20 @@ namespace stream {
 }
 
 namespace video {
+  /** @brief Capturable outputs and the output opened by the encoder. */
+  struct capture_displays_t {
+    std::vector<std::pair<std::string, std::string>> outputs;  ///< Capture name and monitor model.
+    bool parallel_encoding {};  ///< Capture backend supports separate capture workers.
+    /** @brief Check whether a named output can be opened as an independent stream. */
+    bool supports_companion(const std::string &output) const;
+    std::string active;  ///< Currently open capture name.
+    int width {}, height {};  ///< Desktop dimensions before encoding.
+  };
+
+  /** @brief Read the most recent successful capture configuration. */
+  capture_displays_t capture_displays();
+  /** @brief Resolve a monitor shortcut or capture name against a nonempty device list after hotplug. */
+  int resolve_display(const std::variant<int, std::string> &request, const std::vector<std::string> &names, int current);
 
   /**
    * @brief Encoding configuration requested by a remote client.
@@ -614,7 +629,7 @@ namespace video {
       }
     };
 
-    std::vector<replace_t> *replacements = nullptr;  ///< Optional encoded-byte substitutions applied before packetization.
+    std::shared_ptr<const std::vector<replace_t>> replacements;  ///< Optional encoded-byte substitutions applied before packetization.
     stream::session_t *channel_data = nullptr;  ///< Stream session that receives this packet.
     bool after_ref_frame_invalidation = false;  ///< Whether the frame follows reference-frame invalidation.
     std::optional<std::chrono::steady_clock::time_point> frame_timestamp;  ///< Capture timestamp associated with the frame.
@@ -800,11 +815,13 @@ namespace video {
    * @param mail Session mail bus.
    * @param config Client-requested video configuration, normalized before capture begins.
    * @param channel_data Stream session carried with each encoded packet.
+   * @param output Optional independent capture output.
    */
   void capture(
     safe::mail_t mail,
     config_t config,
-    stream::session_t *channel_data
+    stream::session_t *channel_data,
+    const std::string &output = {}
   );
 
   /**
